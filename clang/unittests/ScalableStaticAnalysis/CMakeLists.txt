@@ -1,6 +1,7 @@
 add_distinct_clang_unittest(ClangScalableAnalysisTests
   Analyses/EntityPointerLevel/EntityPointerLevelTest.cpp
   Analyses/ParameterEscape/LibraryFunctionKnowledgeTest.cpp
+  Analyses/ParameterEscape/ParameterEscapeExtractorTest.cpp
   Analyses/PointerFlow/PointerFlowTest.cpp
   Analyses/PointerFlow/PointerFlowWPATest.cpp
   Analyses/CallGraph/CallGraphExtractorTest.cpp
@@ -28,6 +29,7 @@ add_distinct_clang_unittest(ClangScalableAnalysisTests
   Registries/SummaryExtractorRegistryTest.cpp
   Serialization/JSONFormatTest/JSONFormatTest.cpp
   Serialization/JSONFormatTest/LUSummaryTest.cpp
+  Serialization/JSONFormatTest/ParameterEscapeFormatTest.cpp
   Serialization/JSONFormatTest/SharedLexicalRepresentationFormatTest.cpp
   Serialization/JSONFormatTest/TUSummaryTest.cpp
   SourceTransformation/CppBoundedBuffersTest.cpp

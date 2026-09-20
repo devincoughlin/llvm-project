@@ -49,3 +49,33 @@
 // RUN: diff %S/Inputs/rt-linkage-multiple.json %t/rt-linkage-multiple.json
 // RUN: clang-ssaf-format --type tu --encoding %S/Inputs/rt-linkage-multiple.json -o %t/rt-linkage-multiple-enc.json
 // RUN: diff %S/Inputs/rt-linkage-multiple.json %t/rt-linkage-multiple-enc.json
+
+// Pins the on-disk ParameterEscape encoding against the checked-in bytes.
+//
+// What this pins, because the fixture is external to the code: every JSON key
+// name, and the structural shape of the document -- including the
+// callee-major ordering of flows_to, whose two callees interleave differently
+// under any other comparison order.
+//
+// What it does NOT pin: any field *value*. A read/write/diff is the identity
+// under any transform applied symmetrically to the writer and the reader, so
+// this file is blind to which of "line" and "column" carries which field, to
+// reason spellings, to the polarity of "is_candidate", to the -1 spelling of
+// ThisParamIndex, and to swapping any two same-typed sibling fields. The last
+// three are invisible here no matter what this fixture contains: negate the
+// boolean, renumber the sentinel, or exchange two same-typed fields, and the
+// file still round-trips to itself byte for byte. Measured, not assumed.
+//
+// Values are pinned in ParameterEscapeFormatTest, whose RoundTripsAllFields
+// and RoundTripsAbsentShapes assert written bytes against literals for all 29
+// scalar leaves of the format and both sides of every shape, and whose
+// ReasonNamesHaveExpectedSpellings pins all 23 reason spellings. That file's
+// header states the invariant and enumerates the 29 leaves by path.
+//
+// So: adding a field means adding a byte assertion there, not just widening
+// this fixture. Key names and shape are this file's job; values are that
+// file's.
+// RUN: clang-ssaf-format --type tu %S/Inputs/rt-parameter-escape.json -o %t/rt-parameter-escape.json
+// RUN: diff %S/Inputs/rt-parameter-escape.json %t/rt-parameter-escape.json
+// RUN: clang-ssaf-format --type tu --encoding %S/Inputs/rt-parameter-escape.json -o %t/rt-parameter-escape-enc.json
+// RUN: diff %S/Inputs/rt-parameter-escape.json %t/rt-parameter-escape-enc.json

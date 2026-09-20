@@ -1,0 +1,198 @@
+{
+  "data": [
+    {
+      "summary_data": [
+        {
+          "entity_id": 0,
+          "entity_summary": {
+            "candidate_params": [
+              0,
+              1,
+              2
+            ],
+            "is_candidate": true,
+            "params": [
+              {
+                "flows_to": [
+                  {
+                    "callee": {
+                      "@": 1
+                    },
+                    "location": {
+                      "column": 9,
+                      "file": "/src/a.cpp",
+                      "line": 2
+                    },
+                    "param": -1
+                  },
+                  {
+                    "callee": {
+                      "@": 1
+                    },
+                    "location": {
+                      "column": 3,
+                      "file": "/src/a.cpp",
+                      "line": 2
+                    },
+                    "param": 0
+                  },
+                  {
+                    "callee": {
+                      "@": 2
+                    },
+                    "location": {
+                      "column": 7,
+                      "file": "/src/a.cpp",
+                      "line": 5
+                    },
+                    "param": -1
+                  },
+                  {
+                    "callee": {
+                      "@": 2
+                    },
+                    "location": {
+                      "column": 11,
+                      "file": "/src/a.cpp",
+                      "line": 6
+                    },
+                    "param": 4
+                  }
+                ],
+                "index": 0
+              },
+              {
+                "flows_to": [],
+                "index": 1,
+                "returns_self_at": {
+                  "column": 10,
+                  "file": "/src/a.cpp",
+                  "line": 3
+                },
+                "sink": {
+                  "detail": "",
+                  "location": {
+                    "column": 5,
+                    "file": "/src/a.cpp",
+                    "line": 4
+                  },
+                  "reason": "StoreToGlobal"
+                }
+              },
+              {
+                "flows_to": [],
+                "index": 2,
+                "sink": {
+                  "detail": "free",
+                  "location": {
+                    "column": 2,
+                    "file": "/src/a.cpp",
+                    "line": 7
+                  },
+                  "reason": "Deallocation"
+                }
+              }
+            ],
+            "this": {
+              "flows_to": [],
+              "sink": {
+                "detail": "AtomicExpr",
+                "location": {
+                  "column": 1,
+                  "file": "/src/a.cpp",
+                  "line": 9
+                },
+                "reason": "UnrecognizedUse"
+              }
+            }
+          }
+        },
+        {
+          "entity_id": 3,
+          "entity_summary": {
+            "candidate_params": [],
+            "is_candidate": false,
+            "params": [
+              {
+                "flows_to": [],
+                "index": 0,
+                "sink": {
+                  "detail": "",
+                  "location": {
+                    "column": 1,
+                    "file": "/src/b.cpp",
+                    "line": 1
+                  },
+                  "reason": "VirtualCall"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "summary_name": "ParameterEscape"
+    }
+  ],
+  "id_table": [
+    {
+      "id": 0,
+      "name": {
+        "suffix": "",
+        "usr": "c:@F@f#*I#*I#"
+      }
+    },
+    {
+      "id": 1,
+      "name": {
+        "suffix": "",
+        "usr": "c:@F@g#*I#"
+      }
+    },
+    {
+      "id": 2,
+      "name": {
+        "suffix": "",
+        "usr": "c:@F@h#*I#"
+      }
+    },
+    {
+      "id": 3,
+      "name": {
+        "suffix": "",
+        "usr": "c:@F@k#*I#"
+      }
+    }
+  ],
+  "linkage_table": [
+    {
+      "id": 0,
+      "linkage": {
+        "type": "External"
+      }
+    },
+    {
+      "id": 1,
+      "linkage": {
+        "type": "External"
+      }
+    },
+    {
+      "id": 2,
+      "linkage": {
+        "type": "External"
+      }
+    },
+    {
+      "id": 3,
+      "linkage": {
+        "type": "Internal"
+      }
+    }
+  ],
+  "target_triple": "arm64-apple-macosx",
+  "tu_namespace": {
+    "kind": "CompilationUnit",
+    "name": "test.cpp"
+  },
+  "type": "TUSummary"
+}
