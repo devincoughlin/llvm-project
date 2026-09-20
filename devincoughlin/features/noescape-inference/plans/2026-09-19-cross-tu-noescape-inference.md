@@ -8,6 +8,8 @@
 
 **Tech Stack:** C++17, clang AST (`DynamicRecursiveASTVisitor`, `ParentMapContext`), SSAF Core (`TUSummaryExtractor`, `SummaryAnalysis`, `DerivedAnalysis`, `Transformation`, JSON `FormatInfo`), gtest, lit/FileCheck. LLVM's `TargetLibraryInfo`/`BuildLibCalls` are used **only in a unit test** to cross-check a static libcall table.
 
+Filed under #2.
+
 **Spec:** `devincoughlin/features/noescape-inference/specs/2026-09-19-cross-tu-noescape-inference-design.md` — read it first; every rule below argues from it. Version: v2 (revised after an adversarial review of v1; see "Revision notes" at the end).
 
 ## Global Constraints
