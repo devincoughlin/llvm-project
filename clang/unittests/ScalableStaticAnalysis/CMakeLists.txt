@@ -1,5 +1,6 @@
 add_distinct_clang_unittest(ClangScalableAnalysisTests
   Analyses/EntityPointerLevel/EntityPointerLevelTest.cpp
+  Analyses/ParameterEscape/ParameterEscapeExtractorTest.cpp
   Analyses/PointerFlow/PointerFlowTest.cpp
   Analyses/PointerFlow/PointerFlowWPATest.cpp
   Analyses/CallGraph/CallGraphExtractorTest.cpp

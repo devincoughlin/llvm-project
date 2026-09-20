@@ -8,7 +8,9 @@ add_clang_library(clangScalableStaticAnalysisAnalyses
   CallGraph/CallGraphJSONFormat.cpp
   EntityPointerLevel/EntityPointerLevel.cpp
   EntityPointerLevel/EntityPointerLevelFormat.cpp
+  ParameterEscape/EscapeClassifier.cpp
   ParameterEscape/ParameterEscape.cpp
+  ParameterEscape/ParameterEscapeExtractor.cpp
   ParameterEscape/ParameterEscapeFormat.cpp
   PointerFlow/PointerFlow.cpp
   PointerFlow/PointerFlowAnalysis.cpp
@@ -26,6 +28,7 @@ add_clang_library(clangScalableStaticAnalysisAnalyses
   LINK_LIBS
   clangAST
   clangAnalysis
+  clangAnalysisLifetimeSafety
   clangBasic
   clangScalableStaticAnalysisCore
 
