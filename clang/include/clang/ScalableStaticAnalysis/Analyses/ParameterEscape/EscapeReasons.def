@@ -1,0 +1,49 @@
+//===- EscapeReasons.def ----------------------------------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+///
+/// \file
+/// The single source of truth for EscapeReason: this list feeds both the
+/// enumerators and their serialized names, so the two cannot diverge. The
+/// serialized name of a reason is its enumerator spelled exactly as it
+/// appears here, and those names are written to summaries on disk -- renaming
+/// an entry is an on-disk format change.
+///
+/// UnrecognizedUse must stay last; it is the sound default and code iterates
+/// the range [0, UnrecognizedUse].
+///
+//===----------------------------------------------------------------------===//
+
+#ifndef REASON
+#define REASON(NAME)
+#endif
+
+REASON(Return)
+REASON(StoreToField)
+REASON(StoreToGlobal)
+REASON(StoreThroughPointer)
+REASON(AddressTaken)
+REASON(IndirectCall)
+REASON(UnmatchedArgument)
+REASON(CastToNonPointer)
+REASON(Throw)
+REASON(Coroutine)
+REASON(Deallocation)
+REASON(HeapAllocation)
+REASON(NonTrivialView)
+REASON(Asm)
+REASON(VarArgs)
+REASON(Capture)
+REASON(VirtualCall)
+REASON(ObjCMessage)
+REASON(CallableUse)
+REASON(UnnamedCallee)
+REASON(UnanalyzedCallee)
+REASON(EscapesViaCallee)
+REASON(UnrecognizedUse) // must stay last
+
+#undef REASON
