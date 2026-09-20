@@ -1083,6 +1083,16 @@ def _ssaf_transformation_report_file :
     "Output file for the transformation report produced by the source "
     "transformation. The output is a SARIF JSON document.">,
   MarshallingInfoString<SSAFOpts<"TransformationReportFile">>;
+def _ssaf_noescape_spelling :
+  Joined<["--"], "ssaf-noescape-spelling=">,
+  MetaVarName<"<text>">,
+  Group<SSAF_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<
+    "Attribute spelling inserted by the 'infer-noescape' SSAF source "
+    "transformation. Defaults to '__attribute__((noescape))'. Pass the same "
+    "value for every translation unit of a link unit.">,
+  MarshallingInfoString<SSAFOpts<"NoescapeSpelling">>;
 def Xarch__
     : JoinedAndSeparate<["-"], "Xarch_">,
       Flags<[NoXarchOption]>,

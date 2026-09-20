@@ -8449,6 +8449,7 @@ void Clang::ConstructJob(Compilation &C, const JobAction &Job,
   Args.AddLastArg(CmdArgs, options::OPT__ssaf_link_unit_id);
   Args.AddLastArg(CmdArgs, options::OPT__ssaf_src_edit_file);
   Args.AddLastArg(CmdArgs, options::OPT__ssaf_transformation_report_file);
+  Args.AddLastArg(CmdArgs, options::OPT__ssaf_noescape_spelling);
 
   // Handle serialized diagnostics.
   if (Arg *A = Args.getLastArg(options::OPT__serialize_diags)) {

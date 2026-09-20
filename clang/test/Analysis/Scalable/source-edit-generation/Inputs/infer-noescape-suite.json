@@ -1,0 +1,28 @@
+{
+  "type": "WPASuite",
+  "id_table": [
+    {
+      "id": 0,
+      "name": {
+        "namespace": [
+          { "kind": "LinkUnit", "name": "lu" }
+        ],
+        "suffix": "",
+        "usr": "c:@F@f#*I#I#"
+      }
+    }
+  ],
+  "results": [
+    {
+      "analysis_name": "NonEscapingParametersResult",
+      "result": {
+        "NonEscapingParametersResult": {
+          "non_escaping": [
+            { "function": { "@": 0 }, "params": [0] }
+          ],
+          "rejected": []
+        }
+      }
+    }
+  ]
+}

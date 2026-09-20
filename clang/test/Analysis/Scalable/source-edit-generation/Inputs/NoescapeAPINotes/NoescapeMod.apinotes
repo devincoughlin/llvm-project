@@ -1,0 +1,6 @@
+Name: NoescapeMod
+Functions:
+  - Name: f
+    Parameters:
+      - Position: 0
+        NoEscape: true
