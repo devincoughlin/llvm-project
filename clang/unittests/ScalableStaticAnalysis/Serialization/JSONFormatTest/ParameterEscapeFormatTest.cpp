@@ -670,14 +670,19 @@ TEST_F(ParameterEscapeFormatTest, RejectsMalformedOptionalFields) {
 // Parameter indices key std::map<unsigned, ...> / std::set<unsigned>, so an
 // out-of-range or repeated index would collide with a legitimate parameter.
 //
-// checkedParamIndex is called from three sites and the bounds are NOT uniform:
-// "index" and "candidate_params" pass Max = UINT_MAX because they key unsigned
-// containers, but "flows_to[].param" passes INT_MAX because its result goes
-// through static_cast<int>. That difference is deliberate, not an oversight to
-// tidy away -- with Max = UINT_MAX at the flows site, "param": 4294967295 is
-// accepted and written back as -1, turning a flow to parameter 4294967295 into
-// a flow to the implicit object parameter. Both bounds of all three sites are
-// covered below; flow-param-above-int-max is the one that pins the difference.
+// checkedParamIndex is called from three sites and all three pass Max =
+// INT_MAX, even though "index" and "candidate_params" key unsigned containers
+// while only "flows_to[].param" is stored as an int here. The reason is that
+// all three are narrowed to Node::ParamIndex -- an int whose -1 is
+// ThisParamIndex -- on the whole-program side, where nothing can report an
+// error any more. Measured before the "index"/"candidate_params" bound was
+// tightened from UINT_MAX: a summary holding "index": 4294967295 and
+// "candidate_params": [4294967295] made clang-ssaf-analyzer abort inside the
+// fixpoint on an assertion, and with assertions off would have annotated
+// parameter 4294967295 of a real function. UINT_MAX here was not a loose bound
+// that happened to be harmless; it was the defect. Both bounds of all three
+// sites are covered below, and the two "wraps-to-this" cases pin the exact
+// value, with AcceptsLargestValidParameterIndices pinning the other side.
 TEST_F(ParameterEscapeFormatTest, RejectsBadParameterIndices) {
   struct Case {
     llvm::StringLiteral Name;
@@ -687,6 +692,13 @@ TEST_F(ParameterEscapeFormatTest, RejectsBadParameterIndices) {
       {"index-above-unsigned-max",
        R"({"candidate_params":[],"is_candidate":true,)"
        R"("params":[{"flows_to":[],"index":4294967296}]})"},
+      {"index-above-int-max",
+       R"({"candidate_params":[],"is_candidate":true,)"
+       R"("params":[{"flows_to":[],"index":2147483648}]})"},
+      // The value that narrows to ThisParamIndex on the whole-program side.
+      {"index-wraps-to-this",
+       R"({"candidate_params":[],"is_candidate":true,)"
+       R"("params":[{"flows_to":[],"index":4294967295}]})"},
       {"index-negative",
        R"({"candidate_params":[],"is_candidate":true,)"
        R"("params":[{"flows_to":[],"index":-1}]})"},
@@ -695,6 +707,10 @@ TEST_F(ParameterEscapeFormatTest, RejectsBadParameterIndices) {
        R"("params":[{"flows_to":[],"index":1},{"flows_to":[],"index":1}]})"},
       {"candidate-param-above-unsigned-max",
        R"({"candidate_params":[4294967296],"is_candidate":true,"params":[]})"},
+      {"candidate-param-above-int-max",
+       R"({"candidate_params":[2147483648],"is_candidate":true,"params":[]})"},
+      {"candidate-param-wraps-to-this",
+       R"({"candidate_params":[4294967295],"is_candidate":true,"params":[]})"},
       {"candidate-param-negative",
        R"({"candidate_params":[-1],"is_candidate":true,"params":[]})"},
       {"flow-param-below-this",
@@ -716,6 +732,57 @@ TEST_F(ParameterEscapeFormatTest, RejectsBadParameterIndices) {
     EXPECT_THAT_ERROR(readSummaryBody(C.Body, C.Name), llvm::Failed())
         << "case: " << C.Name.str();
   }
+}
+
+// An array of bare scalars owes an element-type case that no missing-key or
+// bound case can stand in for: its elements have no keys to enumerate, and
+// every bound fixture parses as an integer and dies one line lower, at the
+// bound, so the type check is never the guard that fires. Measured with it
+// weakened to "not an integer means 0": the whole suite stayed green while
+// candidate_params:["x"] read back as candidate parameter 0.
+//
+// candidate_params is the only bare-scalar array in this format. Two sibling
+// element-type checks here -- flows_to[] and params[] destructured with
+// getAsObject() -- are reported separately and left alone in this change.
+TEST_F(ParameterEscapeFormatTest, RejectsBadCandidateParamElementTypes) {
+  struct Case {
+    llvm::StringLiteral Name;
+    llvm::StringLiteral Body;
+  };
+  static constexpr Case Cases[] = {
+      {"candidate-param-is-a-string",
+       R"({"candidate_params":["x"],"is_candidate":true,"params":[]})"},
+      {"candidate-param-is-null",
+       R"({"candidate_params":[null],"is_candidate":true,"params":[]})"},
+      {"candidate-param-is-an-array",
+       R"({"candidate_params":[[0]],"is_candidate":true,"params":[]})"},
+      {"candidate-param-is-a-bool",
+       R"({"candidate_params":[true],"is_candidate":true,"params":[]})"},
+  };
+  for (const Case &C : Cases) {
+    EXPECT_THAT_ERROR(readSummaryBody(C.Body, C.Name), llvm::Failed())
+        << "case: " << C.Name.str();
+  }
+}
+
+// The accepting side of the bound above. Without this, tightening the index
+// bound too far -- to zero, or to anything below INT_MAX -- would reject
+// legitimate input with every rejection case above still green.
+TEST_F(ParameterEscapeFormatTest, AcceptsLargestValidParameterIndices) {
+  llvm::Expected<ParameterEscapeSummary> Parsed = parseSummaryBody(
+      R"({"candidate_params":[2147483647],"is_candidate":true,)"
+      R"("params":[{"flows_to":[{"callee":{"@":1},)"
+      R"("location":{"column":3,"file":"a.cpp","line":2},)"
+      R"("param":2147483647}],"index":2147483647}]})",
+      "largest-valid-indices");
+  ASSERT_THAT_EXPECTED(Parsed, llvm::Succeeded());
+  // 2147483647 spelled out rather than INT_MAX: the literal is the bound the
+  // reader is held to, not a restatement of the reader's own constant.
+  EXPECT_EQ(Parsed->CandidateParams, (std::set<unsigned>{2147483647u}));
+  ASSERT_EQ(Parsed->Params.count(2147483647u), 1u);
+  const EscapeFact &F = Parsed->Params.at(2147483647u);
+  ASSERT_EQ(F.FlowsTo.size(), 1u);
+  EXPECT_EQ(F.FlowsTo.begin()->first.ParamIndex, 2147483647);
 }
 
 // ThisParamIndex is a legitimate flow target and must survive the range check

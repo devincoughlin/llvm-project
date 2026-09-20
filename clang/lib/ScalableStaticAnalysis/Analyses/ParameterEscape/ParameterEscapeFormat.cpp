@@ -75,22 +75,10 @@ llvm::Expected<std::string> getOptionalString(const Object &O,
   return S->str();
 }
 
-/// Narrows a JSON integer to a parameter index, rejecting values that would
-/// wrap on conversion. \p Min admits ThisParamIndex where the sentinel is
-/// meaningful and excludes it where it is not.
-llvm::Expected<int64_t> checkedParamIndex(const Value &V, int64_t Raw,
-                                          int64_t Min, int64_t Max,
-                                          llvm::StringLiteral Key) {
-  if (Raw < Min || Raw > Max)
-    return makeSawButExpectedError(
-        V, "a parameter index within range in field %s", Key.data());
-  return Raw;
-}
-
 /// Narrows a JSON integer to a line or column number. Locations are advisory
 /// and never key a container, but an unchecked cast here would still let a
 /// negative or huge value reappear as a wildly different number, so it gets
-/// the same treatment as the parameter indices above.
+/// the same treatment checkedParamIndex gives the parameter indices.
 llvm::Expected<unsigned> checkedLineOrColumn(const Object &O, int64_t Raw,
                                              llvm::StringLiteral Key) {
   if (Raw < 0 || Raw > std::numeric_limits<unsigned>::max())
@@ -100,6 +88,15 @@ llvm::Expected<unsigned> checkedLineOrColumn(const Object &O, int64_t Raw,
 }
 
 } // namespace
+
+llvm::Expected<int64_t>
+clang::ssaf::checkedParamIndex(const Value &V, int64_t Raw, int64_t Min,
+                               int64_t Max, llvm::StringLiteral Key) {
+  if (Raw < Min || Raw > Max)
+    return makeSawButExpectedError(
+        V, "a parameter index within range in field %s", Key.data());
+  return Raw;
+}
 
 Object clang::ssaf::sourceLocationRecordToJSON(const SourceLocationRecord &R) {
   return Object{{FileKey.data(), R.FilePath},
@@ -268,9 +265,14 @@ deserialize(const Object &Data, EntityIdTable &,
   auto S = std::make_unique<ParameterEscapeSummary>();
   S->IsCandidate = *IsCandidate;
 
-  // Params and CandidateParams are keyed by unsigned, so a value above
-  // UINT_MAX would wrap and collide with a legitimate parameter index.
-  constexpr int64_t MaxIndex = std::numeric_limits<unsigned>::max();
+  // Params and CandidateParams are keyed by unsigned, but the whole-program
+  // side narrows both to Node::ParamIndex, which is an int whose -1 is
+  // ThisParamIndex. So the bound is INT_MAX, not UINT_MAX: 4294967295 fits an
+  // unsigned but arrives at the fixpoint as ThisParamIndex, turning a
+  // parameter into the implicit object parameter. Rejecting it here is the
+  // only place that can report it as a format error rather than reaching the
+  // analysis; see RejectsBadParameterIndices.
+  constexpr int64_t MaxIndex = std::numeric_limits<int>::max();
 
   for (const Value &V : *Candidates) {
     std::optional<int64_t> I = V.getAsInteger();

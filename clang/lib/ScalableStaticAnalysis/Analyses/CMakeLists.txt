@@ -9,6 +9,7 @@ add_clang_library(clangScalableStaticAnalysisAnalyses
   EntityPointerLevel/EntityPointerLevel.cpp
   EntityPointerLevel/EntityPointerLevelFormat.cpp
   ParameterEscape/ParameterEscape.cpp
+  ParameterEscape/ParameterEscapeAnalysis.cpp
   ParameterEscape/ParameterEscapeFormat.cpp
   PointerFlow/PointerFlow.cpp
   PointerFlow/PointerFlowAnalysis.cpp

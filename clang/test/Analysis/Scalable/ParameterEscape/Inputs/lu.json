@@ -1,0 +1,71 @@
+{
+  "data": [
+    {
+      "summary_name": "ParameterEscape",
+      "summary_data": [
+        {
+          "entity_id": 0,
+          "entity_summary": {
+            "params": [
+              {"index": 0, "flows_to": []}
+            ],
+            "is_candidate": true,
+            "candidate_params": [0]
+          }
+        },
+        {
+          "entity_id": 1,
+          "entity_summary": {
+            "params": [
+              {
+                "index": 0,
+                "flows_to": [],
+                "sink": {
+                  "reason": "StoreToGlobal",
+                  "detail": "g",
+                  "location": {"file": "a.cpp", "line": 4, "column": 5}
+                }
+              }
+            ],
+            "is_candidate": true,
+            "candidate_params": [0]
+          }
+        },
+        {
+          "entity_id": 2,
+          "entity_summary": {
+            "params": [
+              {
+                "index": 0,
+                "flows_to": [
+                  {
+                    "callee": {"@": 3},
+                    "param": 0,
+                    "location": {"file": "a.cpp", "line": 9, "column": 2}
+                  }
+                ]
+              }
+            ],
+            "is_candidate": true,
+            "candidate_params": [0]
+          }
+        }
+      ]
+    }
+  ],
+  "id_table": [
+    {"id": 0, "name": {"namespace": [{"kind": "LinkUnit", "name": "test.exe"}], "suffix": "", "usr": "c:@F@clean#"}},
+    {"id": 1, "name": {"namespace": [{"kind": "LinkUnit", "name": "test.exe"}], "suffix": "", "usr": "c:@F@leaky#"}},
+    {"id": 2, "name": {"namespace": [{"kind": "LinkUnit", "name": "test.exe"}], "suffix": "", "usr": "c:@F@caller#"}},
+    {"id": 3, "name": {"namespace": [{"kind": "LinkUnit", "name": "test.exe"}], "suffix": "", "usr": "c:@F@gone#"}}
+  ],
+  "linkage_table": [
+    {"id": 0, "linkage": {"type": "External"}},
+    {"id": 1, "linkage": {"type": "External"}},
+    {"id": 2, "linkage": {"type": "External"}},
+    {"id": 3, "linkage": {"type": "External"}}
+  ],
+  "lu_namespace": [{"kind": "LinkUnit", "name": "test.exe"}],
+  "target_triple": "arm64-apple-macosx",
+  "type": "LUSummary"
+}

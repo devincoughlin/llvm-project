@@ -1,0 +1,79 @@
+// Tool-level check of the two whole-program noescape analyses: that the
+// registered name works as a clang-ssaf-analyzer -a argument, that the written
+// WPASuite survives a read/write round trip through clang-ssaf-format, and
+// that two runs over the same input are byte-identical.
+//
+// Those three are what no unit test covers. Registration itself is covered
+// elsewhere and does not need this test: deleting
+// ANCHOR(ParameterEscapeAnalysisAnchorSource) from BuiltinAnchorSources.def
+// was measured to fail 24 unit tests, because the unit binary links the
+// analyses through the same anchor. It was also measured not to abort the
+// analyzer -- it exits 1 with
+//   error: no analysis registered for 'AnalysisName(NonEscapingParametersResult)'
+// so an earlier version of this comment, which claimed a missing anchor would
+// surface only once the transformation consumed the result, was wrong on both
+// counts. Keep the rationale matched to what was measured: a stated reason
+// that does not hold is how the assertion that matters gets deleted later.
+//
+// Inputs/lu.json holds three candidate parameters: clean (no escapes),
+// leaky (a StoreToGlobal sink), and caller (a flow into 'gone', which has no
+// summary in the link unit).
+
+// RUN: rm -rf %t
+// RUN: mkdir -p %t
+
+// RUN: clang-ssaf-analyzer %S/Inputs/lu.json -a NonEscapingParametersResult \
+// RUN:   -o %t/wpa.json
+// RUN: FileCheck %s --input-file=%t/wpa.json
+
+// The fixpoint's verdict comes first: clean is annotated, leaky is rejected
+// with its own sink reason and location, and caller is rejected as
+// UnanalyzedCallee blamed on 'gone' at the call site.
+// CHECK:      "analysis_name": "NonEscapingParametersResult"
+// CHECK:        "non_escaping": [
+// CHECK-NEXT:     {
+// CHECK-NEXT:       "function": {
+// CHECK-NEXT:         "@": 0
+// CHECK:            "params": [
+// CHECK-NEXT:         0
+// CHECK:        "rejected": [
+// CHECK-NEXT:     {
+// CHECK-NEXT:       "detail": "g",
+// CHECK-NEXT:       "location": {
+// CHECK-NEXT:         "column": 5,
+// CHECK-NEXT:         "file": "a.cpp",
+// CHECK-NEXT:         "line": 4
+// CHECK:            "node": {
+// CHECK-NEXT:         "function": {
+// CHECK-NEXT:           "@": 1
+// CHECK:              "param": 0
+// CHECK:            "reason": "StoreToGlobal"
+// CHECK:          {
+// CHECK-NEXT:       "blame": {
+// CHECK-NEXT:         "function": {
+// CHECK-NEXT:           "@": 3
+// CHECK:              "param": 0
+// CHECK:            "detail": "",
+// CHECK-NEXT:       "location": {
+// CHECK-NEXT:         "column": 2,
+// CHECK-NEXT:         "file": "a.cpp",
+// CHECK-NEXT:         "line": 9
+// CHECK:            "node": {
+// CHECK-NEXT:         "function": {
+// CHECK-NEXT:           "@": 2
+// CHECK:              "param": 0
+// CHECK:            "reason": "UnanalyzedCallee"
+
+// The dependency's result is in the suite too, keyed by node.
+// CHECK:      "analysis_name": "ParameterEscapeResult"
+// CHECK:        "candidates": [
+// CHECK:        "facts": [
+
+// The whole suite round trips through the registered deserializers.
+// RUN: clang-ssaf-format --type wpa %t/wpa.json -o %t/wpa-again.json
+// RUN: diff %t/wpa.json %t/wpa-again.json
+
+// Running the analyses twice produces byte-identical output.
+// RUN: clang-ssaf-analyzer %S/Inputs/lu.json -a NonEscapingParametersResult \
+// RUN:   -o %t/wpa-rerun.json
+// RUN: diff %t/wpa.json %t/wpa-rerun.json
