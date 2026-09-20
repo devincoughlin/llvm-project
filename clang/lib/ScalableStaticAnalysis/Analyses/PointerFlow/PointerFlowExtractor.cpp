@@ -15,6 +15,7 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/TypeBase.h"
+#include "clang/ScalableStaticAnalysis/Analyses/CallSiteResolution.h"
 #include "clang/ScalableStaticAnalysis/Analyses/EntityPointerLevel/EntityPointerLevel.h"
 #include "clang/ScalableStaticAnalysis/Analyses/PointerFlow/PointerFlow.h"
 #include "clang/ScalableStaticAnalysis/Core/Model/EntityId.h"
@@ -25,6 +26,7 @@
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/Support/Error.h"
 #include <memory>
+#include <optional>
 
 namespace {
 using namespace clang;
@@ -59,24 +61,6 @@ private:
 
   static DeclPointerLevel toDPL(const NamedDecl *N, bool IsRet = false) {
     return createDeclPointerLevel(N, IsRet);
-  }
-
-  template <typename ParmsProvider, typename ArgsProvider>
-  llvm::Error matchesArgsWithParams(unsigned ArgIdxStart, ParmsProvider *PP,
-                                    ArgsProvider *AP) {
-    unsigned ArgIdx = ArgIdxStart;
-
-    for (unsigned ParmIdx = 0;
-         ParmIdx < PP->getNumParams() && ArgIdx < AP->getNumArgs();
-         ++ArgIdx, ++ParmIdx) {
-      if (const ParmVarDecl *PD = PP->getParamDecl(ParmIdx);
-          PD && hasPtrOrArrType(PD)) {
-        if (auto Err = addEdges(DeclPointerLevelVec{toDPL(PD)},
-                                toDPL(AP->getArg(ArgIdx))))
-          return Err;
-      }
-    }
-    return llvm::Error::success();
   }
 };
 
@@ -160,25 +144,20 @@ llvm::Error PointerFlowMatcher::matchesStmt(const Stmt *S,
     return addEdges(toDPL(BO->getLHS()), toDPL(BO->getRHS()));
   }
 
-  // Match arg-to-param passing (in CallExpr) for any pointer type argument:
-  if (const auto *CE = dyn_cast<CallExpr>(S)) {
-    const FunctionDecl *FD = CE->getDirectCallee();
-
-    if (!FD)
+  // Match arg-to-param passing for calls and constructions of any pointer
+  // type argument. Indirect calls contribute nothing; the implicit object
+  // argument and unmatched arguments are intentionally ignored here.
+  if (isa<CallExpr, CXXConstructExpr>(S)) {
+    std::optional<CallSite> CS = resolveCallSite(S);
+    if (!CS || !CS->Callee)
       return llvm::Error::success();
-
-    unsigned ArgIdx = 0;
-
-    if (isa<CXXOperatorCallExpr>(CE))
-      if (auto *MD = dyn_cast<CXXMethodDecl>(FD);
-          MD && !MD->isExplicitObjectMemberFunction())
-        ArgIdx = 1;
-    return matchesArgsWithParams(ArgIdx, FD, CE);
-  }
-  // Match arg-to-param passing (in CXXConstructExpr) for any pointer type
-  // argument:
-  if (const auto *CCE = dyn_cast<CXXConstructExpr>(S)) {
-    return matchesArgsWithParams(/*ArgIdxStart=*/0, CCE->getConstructor(), CCE);
+    for (auto [Arg, ParamIdx] : CS->Arguments) {
+      const ParmVarDecl *PD = CS->Callee->getParamDecl(ParamIdx);
+      if (PD && hasPtrOrArrType(PD))
+        if (auto Err = addEdges(DeclPointerLevelVec{toDPL(PD)}, toDPL(Arg)))
+          return Err;
+    }
+    return llvm::Error::success();
   }
   if (const auto *RS = dyn_cast<ReturnStmt>(S)) {
     const Expr *RetExpr = RS->getRetValue();
