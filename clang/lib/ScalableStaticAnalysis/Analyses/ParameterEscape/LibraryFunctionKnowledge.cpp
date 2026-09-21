@@ -250,9 +250,22 @@ static const LibraryFunctionFact *lookup(const FunctionDecl *FD,
 }
 
 bool LibraryFunctionKnowledge::isDeallocationFunction(const FunctionDecl *FD,
-                                                      ASTContext &Ctx) {
-  const LibraryFunctionFact *F = lookup(FD, Ctx);
-  return F && F->IsDeallocator;
+                                                      ASTContext &) {
+  // Deliberately not `lookup`: that function answers "should this declaration
+  // be believed", and every reason it has to say no is a reason to refuse here
+  // rather than to stop refusing. See the polarity note on the declaration.
+  if (!FD)
+    return false;
+  const IdentifierInfo *II = FD->getIdentifier();
+  if (!II)
+    return false;
+  llvm::StringRef Name = II->getName();
+  // The compiler's own spelling names the same function.
+  Name.consume_front("__builtin_");
+  for (const LibraryFunctionFact &F : Facts)
+    if (F.IsDeallocator && F.Name == Name && F.Arity == FD->getNumParams())
+      return true;
+  return false;
 }
 
 bool LibraryFunctionKnowledge::parameterDoesNotEscape(const FunctionDecl *FD,

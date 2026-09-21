@@ -25,32 +25,58 @@
 
 namespace clang::ssaf {
 
-/// \returns true iff \p T (after stripping any reference) is a record type
-/// annotated `[[gsl::Pointer]]` or `swift_attr("~Escapable")`, regardless of
-/// its triviality.
-bool isViewLikeRecordType(QualType T);
-
-/// \returns true iff \p T is a view-like record type (isViewLikeRecordType)
-/// that is also trivially copyable and trivially destructible.
-///
-/// Only such views are field-sensitively tracked: a non-trivial view can
-/// stash the pointer in its constructor or destructor, so it is treated as an
-/// opaque object rather than as a carrier of the parameter's provenance.
-bool isTrackedViewType(QualType T);
-
 /// \returns true iff a value of type \p T can carry the provenance of a
 /// parameter: references, any non-function pointer (including ObjC object
-/// pointers), block pointers, and tracked views.
+/// pointers), and block pointers.
 ///
 /// This is the *analysis* population: every parameter of such a type gets an
 /// EscapeFact, whether or not it may be annotated.
+///
+/// No record type is pointer-carrying, and that includes the view-like ones
+/// (`[[gsl::Pointer]]`, `swift_attr("~Escapable")`): M1 tracked those
+/// field-sensitively and no longer does.
+///
+/// A *reference* to one is refused with it -- `V &`, `const V &` and `V &&` --
+/// so that the deferral claims nothing anywhere: reading a field through such
+/// a reference is a load that design section 1.1 makes fresh, so tracking or
+/// not decides what M1 *claims* about `std::span<char> &`, and M1 claims
+/// nothing while the byte-versus-pointer question (#32) is open.
+///
+/// A *pointer* to one stays here, and leaves candidacy instead (see below).
+/// Refusing it from this population would not be subtractive: a pointer cast
+/// preserves provenance, so `takes((V *)p)` would stop being classified as a
+/// flow and become a cast to an unanalyzed type, and a `V *` parameter would
+/// stop carrying facts that callers read.
+///
+/// An alias stored into a view, or passed to its constructor, still sinks
+/// exactly as it does for any other record, and an argument matched to a
+/// parameter this predicate refuses sinks rather than flowing -- which is what
+/// keeps the refusal reject-only.
+///
+// M1 scope: tracked views deferred; see #34. The plan still lists them among
+// M1's candidate types and the design's section 1.1 still defines a by-value
+// view semantics; this declaration is where the implementation diverges.
 bool isPointerCarryingType(QualType T);
 
 /// \returns true iff a parameter of type \p T is eligible for a `noescape`
-/// annotation in M1: references, object pointers, and tracked views.
+/// annotation in M1: references and object pointers.
 ///
 /// This is a subset of isPointerCarryingType; function pointers, block
 /// pointers and ObjC object pointers are analyzed but never annotated.
+///
+/// A view is not a candidate by value or by reference, because neither is
+/// pointer-carrying, and not as a pointer to the record itself either, which
+/// is refused here alone so that it keeps carrying facts while emitting no
+/// annotation. See the M1 scope note there.
+///
+/// Those three are the whole of it, because isViewRecordType() looks one level
+/// down and only at a CXXRecordDecl. A parameter that reaches a view through
+/// another type constructor -- `V (&)[3]`, `V (*)[3]`, `V **`, `V *&`,
+/// `const V *const *`, a record deriving from a view, or `V &` / `V *` where
+/// `V` is incomplete here -- is still a candidate. That is scope rather than a
+/// gap: each is answered exactly as the same shape over a non-view record is,
+/// because the handle comes out of a load through a Place, which design
+/// section 1.1 makes fresh. #34 is where the boundary moves.
 bool isCandidateParameterType(QualType T);
 
 /// \returns true iff the definition \p Def is eligible for annotation

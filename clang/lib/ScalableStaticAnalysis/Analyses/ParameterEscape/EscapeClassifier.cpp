@@ -10,12 +10,27 @@
 #include "clang/AST/Attr.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
+#include "clang/AST/DynamicRecursiveASTVisitor.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
+#include "clang/AST/ExprObjC.h"
+#include "clang/AST/OperationKinds.h"
+#include "clang/AST/ParentMapContext.h"
+#include "clang/AST/Stmt.h"
 #include "clang/AST/StmtCXX.h"
+#include "clang/AST/StmtObjC.h"
+#include "clang/ScalableStaticAnalysis/Analyses/CallSiteResolution.h"
+#include "clang/ScalableStaticAnalysis/Analyses/ParameterEscape/LibraryFunctionKnowledge.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeAnnotations.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/Specifiers.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Casting.h"
+
+#include <cassert>
 
 #include <utility>
 
@@ -29,45 +44,42 @@ static bool hasSwiftNonEscapableAttr(const CXXRecordDecl *RD) {
   return false;
 }
 
-bool clang::ssaf::isViewLikeRecordType(QualType T) {
-  T = T.getNonReferenceType();
+/// \returns true iff \p T is a record type marked `[[gsl::Pointer]]` or
+/// `swift_attr("~Escapable")`.
+///
+/// Used only to *refuse*: M1 defers tracked views (see #34), and a reference to
+/// one is refused alongside a view passed by value. It is not the old
+/// isTrackedViewType -- nothing is admitted to anything on the strength of it,
+/// and it asks for no triviality or layout property, because a refusal needs
+/// none.
+///
+/// An incomplete referent answers false, so a reference to it stays in the
+/// population. That is deliberate and is not a soundness direction either way:
+/// what M1 claims about a reference is that the *reference* does not escape,
+/// which design section 1.1 decides identically for every record. The refusal
+/// below is a scope policy while the byte-versus-pointer question (#32) is
+/// open, so its unknown answer costs precision rather than correctness, and
+/// treating an unnameable record as a view would refuse every opaque handle
+/// type with it.
+static bool isViewRecordType(QualType T) {
   const CXXRecordDecl *RD = T->getAsCXXRecordDecl();
-  // hasDefinition() is crash-preventing, not merely conservative:
-  // getDefinition() below returns null for an incomplete record, and both this
-  // function and isTrackedViewType() then dereference it. No test pins it,
-  // because neither predicate can reach an incomplete record -- such a type can
-  // only be a parameter by pointer or reference, and both return earlier -- but
-  // it must not be read as a rule that could simply be dropped.
   if (!RD || !RD->hasDefinition())
     return false;
   return lifetimes::isGslPointerType(T) ||
          hasSwiftNonEscapableAttr(RD->getDefinition());
 }
 
-bool clang::ssaf::isTrackedViewType(QualType T) {
-  if (!isViewLikeRecordType(T))
-    return false;
-  const CXXRecordDecl *RD =
-      T.getNonReferenceType()->getAsCXXRecordDecl()->getDefinition();
-  // hasTrivialDestructor() is implied by isTriviallyCopyable() -- a class with
-  // a non-trivial destructor is never trivially copyable -- so it can never
-  // reject on its own. It is spelled out because the design states both
-  // requirements, and because a view whose destructor runs could stash the
-  // pointer even if copying it were trivial.
-  return RD->isTriviallyCopyable() && RD->hasTrivialDestructor();
-}
-
 bool clang::ssaf::isPointerCarryingType(QualType T) {
   T = T.getCanonicalType();
+  // A reference to a view is refused with the view itself: `V &`, `const V &`
+  // and `V &&` alike, since getNonReferenceType() strips all three.
   if (T->isReferenceType())
-    return true;
+    return !isViewRecordType(T.getNonReferenceType());
   // isAnyPointerType() also covers ObjC object pointers, which are analyzed
   // (their facts feed callers) even though they are never annotated.
   if (T->isAnyPointerType() && !T->isFunctionPointerType())
     return true;
-  if (T->isBlockPointerType())
-    return true;
-  return isTrackedViewType(T);
+  return T->isBlockPointerType();
 }
 
 bool clang::ssaf::isCandidateParameterType(QualType T) {
@@ -75,13 +87,21 @@ bool clang::ssaf::isCandidateParameterType(QualType T) {
   if (T->isReferenceType())
     // A reference to a function denotes no object, so `noescape` on it would
     // say nothing. Excluding it also removes an unexplained asymmetry with the
-    // function pointer rejected three lines below.
-    return !T->isFunctionReferenceType();
+    // function pointer rejected three lines below. A reference to a view is
+    // refused for the reason on isViewRecordType; it is refused here as well
+    // as above so that this predicate stays a subset of isPointerCarryingType,
+    // which the extractor asserts.
+    return !T->isFunctionReferenceType() &&
+           !isViewRecordType(T.getNonReferenceType());
   // Neither ObjC object pointers nor block pointers are PointerType, so this
   // admits object pointers only; function pointers are excluded explicitly.
+  // A pointer to a view is refused here and *only* here: it stays in the
+  // analysis population, because refusing it there would stop its uses being
+  // classified rather than refuse them, but M1 emits no annotation for a view
+  // shape while #32 is open.
   if (T->isPointerType())
-    return !T->isFunctionPointerType();
-  return isTrackedViewType(T);
+    return !T->isFunctionPointerType() && !isViewRecordType(T->getPointeeType());
+  return false;
 }
 
 bool clang::ssaf::isCandidateDefinition(const FunctionDecl *Def,
@@ -191,6 +211,15 @@ bool clang::ssaf::isCandidateDefinition(const FunctionDecl *Def,
     if (SM.isInSystemHeader(Loc))
       return false;
     // Only parameters we may annotate need a rewritable begin location.
+    //
+    // Keyed on candidacy, not on the analysis population, and deliberately so:
+    // this gate exists to refuse a definition the transformation could not
+    // rewrite, so it must run over exactly the parameters that will be
+    // rewritten. Narrowing isCandidateParameterType therefore *widens* this
+    // gate -- a macro-spelled `V *` no longer blocks the definition it sits in,
+    // and its neighbours become annotatable. The alternative, gating on
+    // isPointerCarryingType, would reject a definition over a parameter nobody
+    // will ever edit, losing every other parameter with it.
     for (const ParmVarDecl *P : RD->parameters()) {
       if (!isCandidateParameterType(P->getType()))
         continue;
@@ -222,10 +251,6 @@ static SourceLocationRecord recordFor(SourceLocation Loc,
     return SourceLocationRecord{"<unknown>", 0, 0};
   return SourceLocationRecord{P.getFilename(), P.getLine(), P.getColumn()};
 }
-
-/// Detail recorded on every stub sink, so a stub fact is distinguishable from
-/// one the real classifier produced.
-static constexpr llvm::StringLiteral StubDetail = "classifier stub";
 
 const llvm::StringLiteral clang::ssaf::MultipleDefinitionsDetail =
     "entity has more than one definition";
@@ -267,30 +292,992 @@ void clang::ssaf::degradeToMultipleDefinitions(ParameterEscapeSummary &S,
     S.This = Escapes;
 }
 
-// Sound placeholder until the real classifier lands: every pointer-carrying
-// parameter, and `this`, escapes. This over-approximates, so no annotation can
-// be inferred while the stub is in the tree.
+//===--- The classifier ---------------------------------------------------===//
+
+namespace {
+
+/// What an expression denotes with respect to the source being analyzed.
+///
+/// The kinds are what separates the pointer *value* the caller handed over --
+/// the thing `noescape` is a promise about -- from the storage that holds it
+/// and from the object it designates. Only a Value can be stored somewhere
+/// that outlives the call; a Place is read and written through, which is
+/// benign (design section 1.1).
+enum class AliasKind : uint8_t {
+  None,      ///< unrelated to the source
+  Value,     ///< a pointer/reference/view value carrying the source's identity
+  Place,     ///< a glvalue denoting the pointee object or one of its subobjects
+  VarLValue, ///< the lvalue of a variable (or referent) holding an alias value
+};
+
+/// The parameter being analyzed. A null Param is the implicit object
+/// parameter, which is a source and a flow target but never a candidate.
+struct Source {
+  const ParmVarDecl *Param = nullptr;
+  bool isThis() const { return Param == nullptr; }
+};
+
+/// Computes one EscapeFact per source for one function definition.
+///
+/// Two passes per source. The first grows the set of local variables that can
+/// hold an alias, to a fixpoint. The second walks every expression, asks what
+/// it denotes with respect to the source, and -- for those that denote
+/// something -- classifies the use its parent makes of it. Every use must land
+/// in a recognized row; the last row is a sink, so a shape this enumeration
+/// does not model reports an escape rather than silence.
+class Classifier {
+public:
+  Classifier(const FunctionDecl *Def, ASTContext &Ctx,
+             TUSummaryExtractor &Extractor)
+      : Def(Def), Ctx(Ctx), SM(Ctx.getSourceManager()), Extractor(Extractor) {}
+
+  EscapeFact analyze(Source S) {
+    Src = S;
+    Fact = EscapeFact();
+    AliasVars.clear();
+    Memo.clear();
+    // `this` seeds no variable: CXXThisExpr is recognized directly.
+    if (Src.Param)
+      AliasVars.insert(Src.Param);
+    growAliasSet();
+    // Kinds computed while the alias set was still growing are stale.
+    Memo.clear();
+    UseVisitor V(*this);
+    V.TraverseDecl(const_cast<FunctionDecl *>(Def));
+    return Fact;
+  }
+
+private:
+  const FunctionDecl *Def;
+  ASTContext &Ctx;
+  const SourceManager &SM;
+  TUSummaryExtractor &Extractor;
+  Source Src;
+  llvm::SmallPtrSet<const VarDecl *, 8> AliasVars;
+  llvm::DenseMap<const Expr *, AliasKind> Memo;
+  EscapeFact Fact;
+
+  //===--- Recording ------------------------------------------------------===//
+
+  void sink(EscapeReason R, SourceLocation Loc, llvm::StringRef Detail = "") {
+    // First sink only, and the traversal is in source order.
+    if (!Fact.OtherSink)
+      Fact.OtherSink = Sink{R, recordFor(Loc, SM), Detail.str()};
+  }
+
+  void recordReturn(SourceLocation Loc) {
+    if (!Fact.ReturnsSelfAt)
+      Fact.ReturnsSelfAt = recordFor(Loc, SM);
+  }
+
+  void flowsTo(const FunctionDecl *Callee, int Index, SourceLocation Loc) {
+    std::optional<EntityId> Id = Extractor.addEntity(Callee);
+    // A callee the entity model cannot name is one the fixpoint could never
+    // read facts from, so the flow has to become an escape instead: dropping
+    // the edge would make the use silently benign. This is not a corner:
+    // getEntityName() refuses every FunctionDecl carrying a builtin id, so
+    // every call to a C library function that the capture table does not
+    // excuse lands here.
+    if (!Id)
+      return sink(EscapeReason::UnnamedCallee, Loc, Callee->getNameAsString());
+    // try_emplace: the recorded location is the *first* call site.
+    Fact.FlowsTo.try_emplace(FlowTarget{*Id, Index}, recordFor(Loc, SM));
+  }
+
+  //===--- Helpers --------------------------------------------------------===//
+
+  /// A local automatic, non-reference variable that can hold an alias value.
+  ///
+  /// Parameters qualify: they are automatic variables the body may overwrite.
+  /// References never do -- writing through one writes the referent, so a
+  /// reference is a store target rather than storage.
+  ///
+  /// The init-capture exclusion here and the init-capture row in classifyUse()
+  /// are one measure, not two: the row claims those declarations, and this
+  /// keeps them out of the storage arms whose assertions rest on the growth
+  /// pass having seen the variable -- which it never does for a declaration
+  /// that lives in a closure object. Neither half is reachable while the other
+  /// stands, so no test pins this exclusion on its own; removing both at once
+  /// is what the assertion catches.
+  static bool isLocalPointerStorage(const VarDecl *VD) {
+    return VD->hasLocalStorage() && !VD->getType()->isReferenceType() &&
+           !VD->hasAttr<BlocksAttr>() && !VD->hasAttr<CleanupAttr>() &&
+           !VD->isInitCapture() && !isa<ImplicitParamDecl>(VD) &&
+           isPointerCarryingType(VD->getType());
+  }
+
+  /// A local reference; it can alias only through its own initializer.
+  static bool isLocalReference(const VarDecl *VD) {
+    return VD->hasLocalStorage() && VD->getType()->isReferenceType() &&
+           !VD->hasAttr<CleanupAttr>() && !VD->isInitCapture() &&
+           !isa<ImplicitParamDecl>(VD);
+  }
+
+  /// One of the two trusted external sources: `noescape` written in source or
+  /// applied by API Notes, on any redeclaration or in the function type.
+  static bool paramIsDeclaredNoescape(const FunctionDecl *FD, unsigned I) {
+    for (const FunctionDecl *R : FD->redecls())
+      if (I < R->getNumParams() && R->getParamDecl(I)->hasAttr<NoEscapeAttr>())
+        return true;
+    if (const auto *FPT = FD->getType()->getAs<FunctionProtoType>())
+      return I < FPT->getNumParams() && FPT->getExtParameterInfo(I).isNoEscape();
+    return false;
+  }
+
+  /// True when `__attribute__((no_builtin))` on the *enclosing* definition
+  /// disables \p Callee's builtin here.
+  ///
+  /// LibraryFunctionKnowledge documents this as a caller obligation: the
+  /// attribute's subject is the function containing the call, which its
+  /// callee-only signature cannot see. The rule mirrors CodeGen's
+  /// addNoBuiltinAttributes(): an empty argument list is stored as the
+  /// wildcard and disables everything. NoBuiltin is not an InheritableAttr,
+  /// so -- as in CodeGen -- only the definition's own attribute counts.
+  bool builtinIsDisabledHere(const FunctionDecl *Callee) const {
+    const auto *NBA = Def->getAttr<NoBuiltinAttr>();
+    if (!NBA)
+      return false;
+    if (llvm::is_contained(NBA->builtinNames(), "*"))
+      return true;
+    unsigned ID = Callee->getBuiltinID();
+    // Not a builtin at all: LibraryFunctionKnowledge would not have trusted it
+    // either, and `no_builtin` can only name builtins.
+    if (!ID)
+      return false;
+    std::string BuiltinName = Ctx.BuiltinInfo.getName(ID);
+    llvm::StringRef Name(BuiltinName);
+    Name.consume_front("__builtin_");
+    return llvm::is_contained(NBA->builtinNames(), Name);
+  }
+
+  /// An implicit trivial copy/move constructor or assignment operator. These
+  /// are unnamable, so a flow edge to them could never be resolved; they are
+  /// recognized at the call site and modelled as a copy of the value instead.
+  static bool isTrivialImplicitCopyOrMove(const FunctionDecl *FD) {
+    if (!FD->isImplicit() || !FD->isTrivial())
+      return false;
+    if (const auto *CD = dyn_cast<CXXConstructorDecl>(FD))
+      return CD->isCopyOrMoveConstructor();
+    if (const auto *MD = dyn_cast<CXXMethodDecl>(FD))
+      return MD->isCopyAssignmentOperator() || MD->isMoveAssignmentOperator();
+    return false;
+  }
+
+  static bool isDeallocationOperator(const FunctionDecl *FD) {
+    OverloadedOperatorKind K = FD->getOverloadedOperator();
+    return K == OO_Delete || K == OO_Array_Delete;
+  }
+
+  DynTypedNode parentOf(const Stmt *S) {
+    DynTypedNodeList Parents = Ctx.getParentMapContext().getParents(*S);
+    return Parents.empty() ? DynTypedNode() : Parents[0];
+  }
+
+  /// Whether \p FD, or the template pattern it came from, has a definition
+  /// this TU can see that is not in a system header.
+  bool definedOutsideSystem(const FunctionDecl *FD) const {
+    const FunctionDecl *Pattern = FD->getTemplateInstantiationPattern();
+    const FunctionDecl *Def = nullptr;
+    if (!(Pattern ? Pattern : FD)->isDefined(Def) || !Def)
+      return false;
+    return !SM.isInSystemHeader(Def->getLocation());
+  }
+
+  /// \returns \p E when it is `{e}` initializing a scalar, which carries the
+  /// value through rather than storing into a subobject, and null otherwise --
+  /// an aggregate's initializer list has no value of its own.
+  ///
+  /// Deliberately not an alias kind on the list: a scalar list appears in the
+  /// AST in a form ParentMapContext does not record a parent for, so giving it
+  /// a kind makes that form a use nobody can account for, which then sinks.
+  /// Both places that care -- the growth pass and the use rule -- look through
+  /// it explicitly instead.
+  static const InitListExpr *asScalarBraceInit(const Expr *E) {
+    const auto *ILE = dyn_cast_or_null<InitListExpr>(E);
+    if (!ILE || ILE->getNumInits() != 1)
+      return nullptr;
+    QualType T = ILE->getType();
+    if (!isPointerCarryingType(T) || T->isRecordType())
+      return nullptr;
+    return ILE;
+  }
+
+  /// Whether \p A is the same operand as \p B. resolveCallSite() reports the
+  /// argument as written, which may carry conversions the classified
+  /// expression does not.
+  static bool sameExpr(const Expr *A, const Expr *B) {
+    return A == B || A->IgnoreParenImpCasts() == B->IgnoreParenImpCasts();
+  }
+
+  //===--- Alias kinds (design section 5.2 derivations) -------------------===//
+
+  AliasKind kind(const Expr *E) {
+    if (!E)
+      return AliasKind::None;
+    auto It = Memo.find(E);
+    if (It != Memo.end())
+      return It->second;
+    AliasKind K = computeKind(E);
+    Memo[E] = K;
+    return K;
+  }
+
+  AliasKind kindOfVarRef(const VarDecl *VD) {
+    if (!AliasVars.count(VD))
+      return AliasKind::None;
+    QualType T = VD->getType();
+    // A reference *is* its referent: naming it denotes the referent, which is
+    // either a holder of an alias value or the pointee object itself.
+    if (T->isReferenceType())
+      return isPointerCarryingType(T.getNonReferenceType())
+                 ? AliasKind::VarLValue
+                 : AliasKind::Place;
+    return AliasKind::VarLValue;
+  }
+
+  AliasKind kindOfCast(const CastExpr *C) {
+    AliasKind S = kind(C->getSubExpr());
+    switch (C->getCastKind()) {
+    case CK_LValueToRValue:
+      // Loading out of storage that holds an alias yields the alias; loading
+      // through a Place yields whatever the pointee happened to contain, which
+      // is a different object's value (design section 1.1).
+      return (S == AliasKind::VarLValue || S == AliasKind::Value)
+                 ? AliasKind::Value
+                 : AliasKind::None;
+    case CK_ArrayToPointerDecay:
+      // An interior pointer into the pointee.
+      return S == AliasKind::Place ? AliasKind::Value : S;
+    case CK_PointerToBoolean:
+    case CK_PointerToIntegral:
+    case CK_ToVoid:
+    case CK_IntegralToPointer:
+    case CK_NullToPointer:
+    case CK_FunctionToPointerDecay:
+    case CK_BuiltinFnToFnPtr:
+      // The result carries no provenance. The operand's own use is still
+      // classified, because a None-kinded parent never covers its child.
+      return AliasKind::None;
+    default:
+      return (isPointerCarryingType(C->getType()) || C->isGLValue())
+                 ? S
+                 : AliasKind::None;
+    }
+  }
+
+  AliasKind kindOfMember(const MemberExpr *ME) {
+    if (!isa<FieldDecl>(ME->getMemberDecl()))
+      return AliasKind::None; // a method reference: classified as a call
+    switch (kind(ME->getBase())) {
+    case AliasKind::None:
+      return AliasKind::None;
+    case AliasKind::Value:
+    case AliasKind::Place:
+      // A subobject of the object the alias designates. No record type is
+      // field-sensitive: what a member of a *record* holds is reached by a
+      // load, and a load through a place is fresh (design section 1.1).
+      return AliasKind::Place;
+    case AliasKind::VarLValue:
+      // Unreachable today: no pointer-carrying type has members, so no member
+      // access has a VarLValue base. Answered Place rather than None because
+      // this is the arm that widens if the pointer-carrying population ever
+      // does (see the M1 scope note in the header) -- Place keeps the address
+      // of such a member a Value that sinks, where None would lose it in
+      // silence, and nothing pins an arm nothing can reach.
+      return AliasKind::Place;
+    }
+    llvm_unreachable("covered");
+  }
+
+  /// Every pointer-carrying call result computed from an alias is an alias.
+  /// No annotation is consulted: this over-approximation is what makes
+  /// `v.data()`, `s[i]` and `v.begin()` sound without `lifetimebound`.
+  AliasKind kindOfCall(const Expr *E) {
+    std::optional<CallSite> CS = resolveCallSite(E);
+    if (!CS)
+      return AliasKind::None;
+    bool Carries = isPointerCarryingType(E->getType());
+    if (!Carries && !E->isGLValue())
+      return AliasKind::None;
+    bool AnyAlias =
+        CS->ImplicitObjectArg && kind(CS->ImplicitObjectArg) != AliasKind::None;
+    for (auto [Arg, Idx] : CS->Arguments)
+      AnyAlias |= kind(Arg) != AliasKind::None;
+    for (const Expr *Arg : CS->UnmatchedArgs)
+      AnyAlias |= kind(Arg) != AliasKind::None;
+    if (!AnyAlias)
+      return AliasKind::None;
+    if (E->isGLValue())
+      return Carries ? AliasKind::VarLValue : AliasKind::Place;
+    return AliasKind::Value;
+  }
+
+  AliasKind computeKind(const Expr *E) {
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(E)) {
+      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+        return kindOfVarRef(VD);
+      if (const auto *BD = dyn_cast<BindingDecl>(DRE->getDecl()))
+        return kind(BD->getBinding());
+      return AliasKind::None;
+    }
+    if (isa<CXXThisExpr>(E))
+      return Src.isThis() ? AliasKind::Value : AliasKind::None;
+    if (const auto *PE = dyn_cast<ParenExpr>(E))
+      return kind(PE->getSubExpr());
+    if (const auto *FE = dyn_cast<FullExpr>(E)) // ExprWithCleanups, ConstantExpr
+      return kind(FE->getSubExpr());
+    if (const auto *MTE = dyn_cast<MaterializeTemporaryExpr>(E))
+      return kind(MTE->getSubExpr());
+    if (const auto *BTE = dyn_cast<CXXBindTemporaryExpr>(E))
+      return kind(BTE->getSubExpr());
+    if (const auto *DAE = dyn_cast<CXXDefaultArgExpr>(E))
+      return kind(DAE->getExpr());
+    if (const auto *DIE = dyn_cast<CXXDefaultInitExpr>(E))
+      return kind(DIE->getExpr());
+    if (const auto *OVE = dyn_cast<OpaqueValueExpr>(E))
+      return kind(OVE->getSourceExpr());
+    if (const auto *GSE = dyn_cast<GenericSelectionExpr>(E))
+      return GSE->isResultDependent() ? AliasKind::None
+                                      : kind(GSE->getResultExpr());
+    if (const auto *CE = dyn_cast<ChooseExpr>(E))
+      return kind(CE->getChosenSubExpr());
+    if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+      const CompoundStmt *Body = SE->getSubStmt();
+      // ValueStmt::getExprStmt() is the query Sema::BuildStmtExpr() itself uses
+      // to give the statement expression its type, and it looks through the
+      // LabelStmt and AttributedStmt wrappers that `({ lbl: p; })` puts in the
+      // way. Asking the same question is what keeps the two in step: taking
+      // body_back() as an Expr instead reports no kind for a labelled last
+      // statement, the wrapped expression then reads as a discarded value under
+      // the statement allow list below, and the store the statement expression
+      // feeds is classified by nobody.
+      const Expr *Value = nullptr;
+      if (!Body->body_empty())
+        if (const auto *VS = dyn_cast<ValueStmt>(Body->body_back()))
+          Value = VS->getExprStmt();
+      if (Value)
+        return kind(Value);
+      // No test pins this and none can today: the line above asks clang the
+      // very question that decided this expression's type, so a
+      // pointer-carrying statement expression always has a value here. It is
+      // the backstop for the two drifting apart -- a pointer-carrying value
+      // nobody can account for must not read as fresh. Value rather than a
+      // sink because computeKind() also runs during the growth pass, where
+      // recording a sink would put it out of source order.
+      return isPointerCarryingType(E->getType()) ? AliasKind::Value
+                                                 : AliasKind::None;
+    }
+    if (const auto *C = dyn_cast<CastExpr>(E))
+      return kindOfCast(C);
+    if (const auto *ME = dyn_cast<MemberExpr>(E))
+      return kindOfMember(ME);
+    if (const auto *UO = dyn_cast<UnaryOperator>(E)) {
+      AliasKind S = kind(UO->getSubExpr());
+      switch (UO->getOpcode()) {
+      case UO_AddrOf:
+        // Taking the address of the pointee is an interior pointer; taking the
+        // address of the *variable* is a sink, classified as a use.
+        return S == AliasKind::Place ? AliasKind::Value : AliasKind::None;
+      case UO_Deref:
+        if (S != AliasKind::Value)
+          return AliasKind::None;
+        return AliasKind::Place;
+      case UO_PostInc:
+      case UO_PostDec:
+      case UO_PreInc:
+      case UO_PreDec:
+        // Incrementing storage that holds an alias yields an alias.
+        return S == AliasKind::VarLValue ? AliasKind::Value : AliasKind::None;
+      case UO_Plus:
+      case UO_Extension:
+        // `__extension__ e` is a transparent wrapper. Without propagating
+        // through it the wrapped alias would have no kind, and the use its
+        // parent makes of it would never be classified.
+        return S;
+      default:
+        return AliasKind::None;
+      }
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(E)) {
+      switch (BO->getOpcode()) {
+      case BO_Add:
+      case BO_Sub:
+        if (!isPointerCarryingType(BO->getType()))
+          return AliasKind::None; // pointer difference
+        return (kind(BO->getLHS()) == AliasKind::Value ||
+                kind(BO->getRHS()) == AliasKind::Value)
+                   ? AliasKind::Value
+                   : AliasKind::None;
+      case BO_Assign:
+        return kind(BO->getLHS());
+      case BO_Comma:
+        return kind(BO->getRHS());
+      default:
+        if (isa<CompoundAssignOperator>(BO))
+          return kind(BO->getLHS());
+        return AliasKind::None;
+      }
+    }
+    if (const auto *CO = dyn_cast<AbstractConditionalOperator>(E)) {
+      AliasKind T = kind(CO->getTrueExpr()), F = kind(CO->getFalseExpr());
+      if (T == AliasKind::None && F == AliasKind::None)
+        return AliasKind::None;
+      if (!E->isGLValue())
+        return AliasKind::Value;
+      return T != AliasKind::None ? T : F;
+    }
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E)) {
+      AliasKind B = kind(ASE->getBase());
+      return (B == AliasKind::Value || B == AliasKind::Place)
+                 ? AliasKind::Place
+                 : AliasKind::None;
+    }
+    // An Objective-C instance variable reached through the parameter is a
+    // subobject of the object it designates, exactly like `a->m`.
+    if (const auto *IRE = dyn_cast<ObjCIvarRefExpr>(E)) {
+      AliasKind B = kind(IRE->getBase());
+      return (B == AliasKind::Value || B == AliasKind::Place)
+                 ? AliasKind::Place
+                 : AliasKind::None;
+    }
+    if (isa<CallExpr, CXXConstructExpr>(E))
+      return kindOfCall(E);
+    return AliasKind::None;
+  }
+
+  //===--- Growth (locals that receive aliases) ---------------------------===//
+
+  bool growByInit(const VarDecl *VD, AliasKind K) {
+    if (K == AliasKind::None)
+      return false;
+    if (isLocalReference(VD)) {
+      // Binding a reference to the pointer *variable* is an escape of the
+      // variable, handled by the use rule; the reference is then an alias of
+      // the storage, which this analysis does not model.
+      //
+      // No test pins this and none can: the initializer that would add the
+      // variable is also the use that sinks AddressTaken, and that sink is
+      // recorded before any use of the reference could be reached, so letting
+      // it in would only add redundant flow edges to a node that has already
+      // escaped.
+      if (K == AliasKind::VarLValue)
+        return false;
+      return AliasVars.insert(VD).second;
+    }
+    if (isLocalPointerStorage(VD))
+      return AliasVars.insert(VD).second;
+    return false;
+  }
+
+  bool growByAssign(const VarDecl *VD, AliasKind K) {
+    if (K == AliasKind::None || !isLocalPointerStorage(VD))
+      return false;
+    return AliasVars.insert(VD).second;
+  }
+
+  /// Finds the variables that can hold an alias. Flow-insensitive: a variable
+  /// that ever receives an alias is treated as holding one everywhere, which
+  /// over-approximates and so can only add uses to classify.
+  class GrowthVisitor : public DynamicRecursiveASTVisitor {
+    Classifier &C;
+
+  public:
+    bool Changed = false;
+    explicit GrowthVisitor(Classifier &C) : C(C) {
+      ShouldVisitImplicitCode = true;
+    }
+    bool TraverseDecl(Decl *D) override {
+      if (D && D != C.Def &&
+          isa<FunctionDecl, RecordDecl, BlockDecl, ObjCMethodDecl>(D))
+        return true;
+      return DynamicRecursiveASTVisitor::TraverseDecl(D);
+    }
+    // A lambda's or block's body reaches an enclosing local only through a
+    // capture, and every capture of an alias is a sink, so nothing inside can
+    // grow the alias set.
+    // A lambda's or block's *body* reaches an enclosing local only through a
+    // capture, and every capture of an alias is a sink, so nothing inside it
+    // can grow the alias set. An init-capture's initializer is different: it
+    // runs in the enclosing function, so it is traversed.
+    bool TraverseLambdaExpr(LambdaExpr *LE) override {
+      for (Expr *Init : LE->capture_inits())
+        if (Init && !TraverseStmt(Init))
+          return false;
+      return true;
+    }
+    bool TraverseBlockExpr(BlockExpr *) override { return true; }
+    bool VisitVarDecl(VarDecl *VD) override {
+      if (!VD->hasInit())
+        return true;
+      const Expr *Init = VD->getInit();
+      if (const InitListExpr *ILE = asScalarBraceInit(Init))
+        Init = ILE->getInit(0);
+      Changed |= C.growByInit(VD, C.kind(Init));
+      return true;
+    }
+    bool VisitBinaryOperator(BinaryOperator *BO) override {
+      if (BO->getOpcode() != BO_Assign)
+        return true;
+      if (const auto *DRE = dyn_cast<DeclRefExpr>(BO->getLHS()->IgnoreParenImpCasts()))
+        if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+          Changed |= C.growByAssign(VD, C.kind(BO->getRHS()));
+      return true;
+    }
+  };
+
+  void growAliasSet() {
+    for (;;) {
+      // Kinds depend on the alias set, which just grew.
+      Memo.clear();
+      GrowthVisitor V(*this);
+      V.TraverseDecl(const_cast<FunctionDecl *>(Def));
+      if (!V.Changed)
+        return;
+    }
+  }
+
+  //===--- Use classification (design section 5.2 table) ------------------===//
+
+  /// True when \p PE -- an alias-kinded parent -- already accounts for \p E's
+  /// use, so E itself needs no classification.
+  ///
+  /// Every entry is a value-preserving derivation from computeKind(): the
+  /// operand's value is consumed only to compute the parent's, which is itself
+  /// an alias and is classified by *its* parent. Call arguments, implicit
+  /// object arguments and assignment right-hand sides are never pass-through,
+  /// which is what makes `int *q = id(p)` record a flow as well as an alias,
+  /// and `*pp = pp` record a store.
+  bool isCoveredByParent(const Expr *E, const Expr *PE) {
+    if (kind(PE) == AliasKind::None)
+      return false;
+    if (isa<ParenExpr, FullExpr, MaterializeTemporaryExpr, CXXBindTemporaryExpr,
+            OpaqueValueExpr, CXXDefaultArgExpr, CXXDefaultInitExpr,
+            GenericSelectionExpr, ChooseExpr, CastExpr, MemberExpr,
+            ObjCIvarRefExpr, ArraySubscriptExpr, AbstractConditionalOperator,
+            UnaryOperator>(PE))
+      return true;
+    if (const auto *BO = dyn_cast<BinaryOperator>(PE)) {
+      if (BO->getOpcode() == BO_Assign || isa<CompoundAssignOperator>(BO))
+        return BO->getLHS() == E; // the RHS is a store and must be classified
+      // Only the right operand carries the comma's value. The left one is
+      // discarded, which the use rule below reports as benign, so no input
+      // distinguishes this from `true` -- it states the intent rather than
+      // deciding an outcome.
+      if (BO->getOpcode() == BO_Comma)
+        return BO->getRHS() == E;
+      return true; // pointer arithmetic
+    }
+    return false;
+  }
+
+  class UseVisitor : public DynamicRecursiveASTVisitor {
+    Classifier &C;
+
+  public:
+    explicit UseVisitor(Classifier &C) : C(C) { ShouldVisitImplicitCode = true; }
+    bool TraverseDecl(Decl *D) override {
+      if (D && D != C.Def &&
+          isa<FunctionDecl, RecordDecl, BlockDecl, ObjCMethodDecl>(D))
+        return true;
+      return DynamicRecursiveASTVisitor::TraverseDecl(D);
+    }
+    bool TraverseLambdaExpr(LambdaExpr *LE) override {
+      // Every capture also has an initializer, and the loop over those catches
+      // strictly more -- a capture of a structured binding, whose captured
+      // declaration is not a VarDecl, for one. No test fires this loop alone;
+      // it is the backstop for a capture whose initializer is absent, and it
+      // only adds sinks.
+      for (const LambdaCapture &Cap : LE->captures()) {
+        if (Cap.capturesThis() && C.Src.isThis())
+          C.sink(EscapeReason::Capture, LE->getBeginLoc());
+        if (Cap.capturesVariable())
+          if (const auto *VD = dyn_cast<VarDecl>(Cap.getCapturedVar());
+              VD && C.AliasVars.count(VD))
+            C.sink(EscapeReason::Capture, Cap.getLocation());
+      }
+      for (Expr *Init : LE->capture_inits()) {
+        if (!Init)
+          continue;
+        if (C.kind(Init) != AliasKind::None)
+          C.sink(EscapeReason::Capture, Init->getBeginLoc());
+        // An init-capture's initializer is evaluated in the *enclosing*
+        // function, so it is ordinary code and its subexpressions are ordinary
+        // uses: `[n = record(p)]` passes p to record() before any capture
+        // happens. Checking only the initializer's own kind would see nothing
+        // there, because the initializer is an `int`.
+        if (!TraverseStmt(Init))
+          return false;
+      }
+      // The *body* is not traversed: it can reach an enclosing local only
+      // through a capture, and every capture of an alias has just sunk.
+      return true;
+    }
+    bool TraverseBlockExpr(BlockExpr *BE) override {
+      for (const BlockDecl::Capture &Cap : BE->getBlockDecl()->captures())
+        if (C.AliasVars.count(Cap.getVariable()))
+          C.sink(EscapeReason::Capture, BE->getBeginLoc());
+      if (BE->getBlockDecl()->capturesCXXThis() && C.Src.isThis())
+        C.sink(EscapeReason::Capture, BE->getBeginLoc());
+      return true;
+    }
+    // DynamicRecursiveASTVisitor has no VisitExpr.
+    bool VisitStmt(Stmt *S) override {
+      const auto *E = dyn_cast<Expr>(S);
+      if (!E)
+        return true;
+      AliasKind K = C.kind(E);
+      if (K == AliasKind::None)
+        return true;
+      DynTypedNode P = C.parentOf(E);
+      if (const auto *PE = P.get<Expr>(); PE && C.isCoveredByParent(E, PE))
+        return true;
+      C.classifyUse(E, K, P);
+      return true;
+    }
+  };
+
+  /// Classify a store of an alias into \p Target.
+  void classifyStoreInto(const Expr *Target, SourceLocation Loc) {
+    const Expr *T = Target->IgnoreParenImpCasts();
+    if (const auto *DRE = dyn_cast<DeclRefExpr>(T)) {
+      if (const auto *VD = dyn_cast<VarDecl>(DRE->getDecl())) {
+        if (isLocalPointerStorage(VD)) {
+          // Benign only because the growth pass put the variable in the alias
+          // set, so that what is stored here is classified at the variable's
+          // own uses. Assert it rather than assume it: when the two passes
+          // disagree about what writes a local, this arm is where the escape
+          // would be dropped.
+          assert(AliasVars.count(VD) &&
+                 "a local that receives an alias must have joined the alias "
+                 "set during the growth pass");
+          return;
+        }
+        // Writing through a reference writes whatever it was bound to, which
+        // this analysis does not track.
+        if (VD->getType()->isReferenceType())
+          return sink(EscapeReason::StoreThroughPointer, Loc,
+                      VD->getNameAsString());
+        if (VD->hasAttr<BlocksAttr>())
+          return sink(EscapeReason::Capture, Loc);
+        if (VD->hasAttr<CleanupAttr>())
+          return sink(EscapeReason::AddressTaken, Loc);
+        return sink(EscapeReason::StoreToGlobal, Loc, VD->getNameAsString());
+      }
+      // Not a variable (a non-type template parameter, say). Unpinned, and the
+      // sink direction is the safe one.
+      return sink(EscapeReason::StoreThroughPointer, Loc);
+    }
+    if (const auto *ME = dyn_cast<MemberExpr>(T)) {
+      return sink(EscapeReason::StoreToField, Loc,
+                  ME->getMemberDecl()->getNameAsString());
+    }
+    return sink(EscapeReason::StoreThroughPointer, Loc);
+  }
+
+  /// Classify \p M's use as an argument or implicit object of \p Call.
+  void classifyCallUse(const Expr *M, AliasKind K, const Expr *Call) {
+    SourceLocation Loc = M->getBeginLoc();
+    std::optional<CallSite> CS = resolveCallSite(Call);
+    if (!CS || !CS->Callee)
+      return sink(EscapeReason::IndirectCall, Loc);
+    const FunctionDecl *Callee = CS->Callee;
+    // No callee parameter to attribute the flow to. resolveCallSite() reports
+    // an argument as unmatched for a variadic tail, an unprototyped callee, an
+    // arity mismatch and a static member operator's object expression alike;
+    // only a prototyped variadic callee can have a variadic tail, so that is
+    // what separates the VarArgs row from the rest.
+    if (llvm::any_of(CS->UnmatchedArgs,
+                     [&](const Expr *A) { return sameExpr(A, M); }))
+      return sink(Callee->isVariadic() ? EscapeReason::VarArgs
+                                       : EscapeReason::UnmatchedArgument,
+                  Loc);
+    // `noescape` also forbids deallocating through the parameter, so a
+    // deallocator is refused even where LLVM proves it does not capture. This
+    // row and the two benign rows below consume the same table with opposite
+    // polarities: there, not recognizing the callee must withhold trust; here,
+    // not recognizing it must not withhold the refusal. isDeallocationFunction
+    // is ungated for that reason -- a body that frees through the pointer is
+    // indistinguishable from one that merely writes through it.
+    if (isDeallocationOperator(Callee) ||
+        LibraryFunctionKnowledge::isDeallocationFunction(Callee, Ctx))
+      return sink(EscapeReason::Deallocation, Loc);
+    const auto *MD = dyn_cast<CXXMethodDecl>(Callee);
+    if (CS->ImplicitObjectArg && sameExpr(CS->ImplicitObjectArg, M)) {
+      // The body that runs is the override's, which this TU need not contain.
+      if (MD && MD->isVirtual())
+        return sink(EscapeReason::VirtualCall, Loc);
+      // A trivial copy or move reads the object, or -- as the left operand of
+      // `v2 = v1` -- overwrites it. Neither leaks the object itself, and
+      // overwriting is benign for the same reason that `out = p` is benign for
+      // a reference parameter `out`: the analysis is flow-insensitive and goes
+      // on treating the old value as live.
+      if (isTrivialImplicitCopyOrMove(Callee))
+        return;
+      return flowsTo(Callee, ThisParamIndex, Loc);
+    }
+    for (auto [Arg, Idx] : CS->Arguments) {
+      if (!sameExpr(Arg, M))
+        continue;
+      // `std::move`/`std::forward` and friends only re-type their operand; the
+      // result refers to the same object, kindOfCall() makes it an alias, and
+      // its own uses are classified. Recording a flow instead would name a
+      // callee the entity model refuses -- clang models these as builtins --
+      // so the use would degrade to UnnamedCallee and no parameter that is
+      // ever moved or forwarded could be annotated.
+      if (lifetimes::isStdReferenceCast(Callee) && !definedOutsideSystem(Callee))
+        return;
+      if (paramIsDeclaredNoescape(Callee, Idx))
+        return;
+      if (!builtinIsDisabledHere(Callee) &&
+          LibraryFunctionKnowledge::parameterDoesNotEscape(Callee, Idx, Ctx))
+        return;
+      if (isTrivialImplicitCopyOrMove(Callee)) {
+        if (K == AliasKind::Place)
+          return; // copying the pointee by value is a load
+        return classifyStoreInto(
+            CS->ImplicitObjectArg ? CS->ImplicitObjectArg : Call, Loc);
+      }
+      if (MD && MD->isVirtual())
+        return sink(EscapeReason::VirtualCall, Loc);
+      // A parameter outside the analyzed population has no node to flow into,
+      // and an edge recorded against one cannot be resolved: the callee's
+      // summary holds no fact for it, so whatever the callee does with it is
+      // lost rather than deferred. That matters even where the *type* was
+      // refused on scope grounds -- `void keeps(V &v) { g_pv = &v; }` is an
+      // ordinary pointer escape, and its caller must not be told the argument
+      // merely flows somewhere. Refusing a type stays reject-only only because
+      // this row turns its uses into sinks.
+      if (!isPointerCarryingType(Callee->getParamDecl(Idx)->getType()))
+        return sink(EscapeReason::UnrecognizedUse, Loc,
+                    "callee parameter outside the analyzed population");
+      return flowsTo(Callee, Idx, Loc);
+    }
+    // M is nested inside an argument without being the argument: the argument
+    // expression's own kind covers it.
+  }
+
+  /// Classify \p M's use as a member, base or delegating initializer of \p CD.
+  ///
+  /// ParentMapContext does not model CXXCtorInitializer, so the parent of a
+  /// member initializer's expression is the constructor itself.
+  void classifyCtorInitUse(const Expr *M, const CXXConstructorDecl *CD) {
+    SourceLocation Loc = M->getBeginLoc();
+    for (const CXXCtorInitializer *CI : CD->inits()) {
+      if (CI->getInit() != M)
+        continue;
+      if (CI->isDelegatingInitializer())
+        return; // the CXXConstructExpr's arguments are classified as a call
+      return sink(EscapeReason::StoreToField, Loc);
+    }
+    // An expression whose parent is a constructor but which is none of its
+    // initializers -- a default member initializer evaluated here, for
+    // instance. Unmodelled, so it sinks.
+    sink(EscapeReason::UnrecognizedUse, Loc, "constructor initializer");
+  }
+
+  /// The table of design section 5.2, read top to bottom. \p M denotes
+  /// something with respect to the source; \p P is its parent node.
+  void classifyUse(const Expr *M, AliasKind K, const DynTypedNode &P) {
+    SourceLocation Loc = M->getBeginLoc();
+
+    if (const auto *RS = P.get<ReturnStmt>())
+      return recordReturn(RS->getBeginLoc());
+    if (const auto *CD = P.get<CXXConstructorDecl>())
+      return classifyCtorInitUse(M, CD);
+    if (const auto *VD = P.get<VarDecl>()) {
+      // An init-capture's variable lives in the closure object, not in this
+      // function, so initializing it is a capture rather than a store into
+      // local storage. The two storage predicates exclude it for the same
+      // reason, which is what the assertions below rest on -- the growth pass
+      // never visits these declarations.
+      //
+      // No test can pin this row on its own: it is reached only when the
+      // initializer has an alias kind of its own, which is exactly when
+      // TraverseLambdaExpr() has already recorded the same Capture sink. It is
+      // here so that the classification of this use does not depend on that
+      // ordering, and so that the storage predicates above have somewhere to
+      // hand the declarations they exclude.
+      if (VD->isInitCapture())
+        return sink(EscapeReason::Capture, Loc);
+      if (isLocalReference(VD)) {
+        // Binding a reference to the pointer variable exposes the storage;
+        // binding it to the pointee is an ordinary alias derivation.
+        if (K == AliasKind::VarLValue)
+          return sink(EscapeReason::AddressTaken, Loc);
+        assert(AliasVars.count(VD) && "a local reference bound to an alias must "
+                                      "have joined the alias set");
+        return;
+      }
+      if (isLocalPointerStorage(VD)) {
+        assert(AliasVars.count(VD) && "a local initialized with an alias must "
+                                      "have joined the alias set");
+        return; // the variable joined the alias set
+      }
+      if (VD->hasAttr<BlocksAttr>())
+        return sink(EscapeReason::Capture, Loc);
+      if (VD->hasAttr<CleanupAttr>())
+        return sink(EscapeReason::AddressTaken, Loc);
+      if (VD->hasGlobalStorage())
+        return sink(EscapeReason::StoreToGlobal, Loc, VD->getNameAsString());
+      // A local of a type that cannot hold an alias, initialized from one --
+      // a C aggregate copy of the pointee, say. Unmodelled, so it sinks.
+      return sink(EscapeReason::UnrecognizedUse, Loc, "variable initializer");
+    }
+    // A structured binding's own binding expression defines the alias rather
+    // than using it.
+    if (P.get<BindingDecl>())
+      return;
+    if (P.get<GCCAsmStmt>())
+      return sink(EscapeReason::Asm, Loc);
+    // Statement parents are an allow list: these read or discard the value.
+    // Anything else -- an ObjC fast enumeration, an OpenMP captured region --
+    // reaches the default sink below rather than passing for a discarded
+    // value.
+    if (P.get<CompoundStmt>() || P.get<IfStmt>() || P.get<SwitchStmt>() ||
+        P.get<WhileStmt>() || P.get<DoStmt>() || P.get<ForStmt>() ||
+        P.get<CXXForRangeStmt>() || P.get<SwitchCase>() ||
+        P.get<LabelStmt>() || P.get<AttributedStmt>())
+      return;
+    if (const auto *PS = P.get<Stmt>(); PS && !P.get<Expr>())
+      return sink(EscapeReason::UnrecognizedUse, Loc, PS->getStmtClassName());
+
+    const Expr *PE = P.get<Expr>();
+    // No parent at all: the expression is outside anything the parent map
+    // built, so nothing can say what is done with it.
+    if (!PE)
+      return sink(EscapeReason::UnrecognizedUse, Loc, "no parent");
+
+    if (isa<CXXThrowExpr>(PE))
+      return sink(EscapeReason::Throw, Loc);
+    if (isa<CXXNewExpr>(PE))
+      return sink(EscapeReason::HeapAllocation, Loc);
+    if (isa<CXXDeleteExpr>(PE))
+      return sink(EscapeReason::Deallocation, Loc);
+    if (const auto *ILE = dyn_cast<InitListExpr>(PE)) {
+      // `int *q = {p}` is `int *q = p`: the list is transparent, so the use is
+      // whatever is done with the list itself -- an initialization of local
+      // storage here, an argument or a return elsewhere.
+      if (asScalarBraceInit(ILE))
+        return classifyUse(ILE, K, parentOf(ILE));
+      return sink(EscapeReason::StoreToField, Loc);
+    }
+    if (isa<DesignatedInitExpr, CXXParenListInitExpr>(PE))
+      return sink(EscapeReason::StoreToField, Loc);
+    if (isa<ObjCMessageExpr>(PE))
+      return sink(EscapeReason::ObjCMessage, Loc);
+    // Unevaluated operands: the value is never formed. This covers only an
+    // alias that is a *direct* child, which is the whole of `sizeof(*p)` but
+    // almost none of `noexcept(f(p))` -- there the call is classified on its
+    // own and records a flow that cannot happen at run time. That is the safe
+    // direction, and this row must not be read as covering it.
+    if (isa<UnaryExprOrTypeTraitExpr, CXXNoexceptExpr>(PE))
+      return;
+    if (const auto *C = dyn_cast<CastExpr>(PE)) {
+      switch (C->getCastKind()) {
+      case CK_LValueToRValue:
+      case CK_PointerToBoolean:
+      case CK_ToVoid:
+        return;
+      default:
+        return sink(EscapeReason::CastToNonPointer, Loc, C->getCastKindName());
+      }
+    }
+    if (const auto *ME = dyn_cast<MemberExpr>(PE)) {
+      if (isa<CXXMethodDecl>(ME->getMemberDecl())) {
+        DynTypedNode GP = parentOf(ME);
+        if (const auto *MCE = GP.get<CXXMemberCallExpr>())
+          return classifyCallUse(M, K, MCE);
+        // Forming a pointer to member of an alias object. Unpinned; the sink
+        // direction is the safe one.
+        return sink(EscapeReason::CallableUse, Loc);
+      }
+      return; // reading a field that carries no pointer
+    }
+    if (const auto *UO = dyn_cast<UnaryOperator>(PE)) {
+      if (UO->getOpcode() == UO_AddrOf)
+        return sink(EscapeReason::AddressTaken, Loc);
+      // `!p` reads the value and yields a bool. C++ converts the operand with
+      // a CK_PointerToBoolean cast, which the cast row above answers, but C
+      // has no such cast and the alias is the direct operand.
+      if (UO->getOpcode() == UO_LNot)
+        return;
+      // A read-modify-write *through* a place -- `(*p)++`, `++p[i]` -- writes
+      // the pointee and yields a value loaded from it, neither of which is the
+      // pointer that designates it. (When the operand is storage rather than a
+      // place the result is an alias, so the operand is covered by its parent
+      // and never reaches this row.)
+      if (UO->isIncrementDecrementOp())
+        return;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(PE)) {
+      if (BO->getOpcode() == BO_Assign && BO->getRHS() == M)
+        return classifyStoreInto(BO->getLHS(), Loc);
+      if (BO->isComparisonOp() || BO->isLogicalOp() ||
+          (BO->getOpcode() == BO_Comma && BO->getLHS() == M) ||
+          (BO->getOpcode() == BO_Sub && !isPointerCarryingType(BO->getType())))
+        return; // isLogicalOp: `p && q` in C, for the same reason as `!p`
+      return sink(EscapeReason::UnrecognizedUse, Loc,
+                  BO->getOpcodeStr().str());
+    }
+    // The condition of `p ? a : b`, again a value read that C spells without a
+    // conversion. Only the condition: a branch is the conditional's value, and
+    // a conditional whose value is an alias covers its branches as a
+    // pass-through parent instead of reaching here.
+    if (const auto *CO = dyn_cast<AbstractConditionalOperator>(PE);
+        CO && CO->getCond() == M)
+      return;
+    if (const auto *CE = dyn_cast<CallExpr>(PE)) {
+      if (sameExpr(CE->getCallee(), M))
+        return sink(EscapeReason::CallableUse, Loc);
+      return classifyCallUse(M, K, CE);
+    }
+    if (isa<CXXConstructExpr>(PE)) {
+      if (parentOf(PE).get<CXXNewExpr>())
+        return sink(EscapeReason::HeapAllocation, Loc);
+      return classifyCallUse(M, K, PE);
+    }
+    return sink(EscapeReason::UnrecognizedUse, Loc, PE->getStmtClassName());
+  }
+};
+
+} // namespace
+
 FunctionEscapeFacts
 clang::ssaf::classifyFunctionEscapes(const FunctionDecl *Def, ASTContext &Ctx,
-                                     TUSummaryExtractor &) {
+                                     TUSummaryExtractor &Extractor) {
   FunctionEscapeFacts Facts;
   const SourceManager &SM = Ctx.getSourceManager();
-  bool IsCoroutine = isa_and_nonnull<CoroutineBodyStmt>(Def->getBody());
-  EscapeReason R =
-      IsCoroutine ? EscapeReason::Coroutine : EscapeReason::UnrecognizedUse;
-  Sink S{R, recordFor(Def->getLocation(), SM), StubDetail.str()};
+  const auto *MD = dyn_cast<CXXMethodDecl>(Def);
+  bool HasThis = MD && MD->isInstance();
 
-  for (const ParmVarDecl *P : Def->parameters()) {
-    if (!isPointerCarryingType(P->getType()))
-      continue;
-    EscapeFact F;
-    F.OtherSink = S;
-    Facts.Params[P->getFunctionScopeIndex()] = std::move(F);
+  // A coroutine's parameters are copied into the coroutine frame, which
+  // outlives the call, and the body the classifier would walk is the
+  // transformed one. Nothing here is analyzable, so everything sinks.
+  if (isa_and_nonnull<CoroutineBodyStmt>(Def->getBody())) {
+    Sink S{EscapeReason::Coroutine, recordFor(Def->getBody()->getBeginLoc(), SM),
+           ""};
+    for (const ParmVarDecl *P : Def->parameters())
+      if (isPointerCarryingType(P->getType())) {
+        EscapeFact F;
+        F.OtherSink = S;
+        Facts.Params[P->getFunctionScopeIndex()] = std::move(F);
+      }
+    if (HasThis) {
+      EscapeFact F;
+      F.OtherSink = S;
+      Facts.This = std::move(F);
+    }
+    return Facts;
   }
-  if (const auto *MD = dyn_cast<CXXMethodDecl>(Def); MD && MD->isInstance()) {
-    EscapeFact F;
-    F.OtherSink = S;
-    Facts.This = std::move(F);
-  }
+
+  Classifier C(Def, Ctx, Extractor);
+  // A fact for every pointer-carrying parameter, clean or not: CandidateParams
+  // is a subset of these keys, and a candidate parameter without a fact would
+  // be dropped with an "empty" summary.
+  for (const ParmVarDecl *P : Def->parameters())
+    if (isPointerCarryingType(P->getType()))
+      Facts.Params[P->getFunctionScopeIndex()] = C.analyze(Source{P});
+  if (HasThis)
+    Facts.This = C.analyze(Source{nullptr});
   return Facts;
 }

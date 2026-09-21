@@ -34,6 +34,9 @@ REASON(Throw)
 REASON(Coroutine)
 REASON(Deallocation)
 REASON(HeapAllocation)
+// Reserved: produced by nothing since tracked-view support was deferred out of
+// M1 (see #34). Kept rather than removed because a serialized name is on-disk
+// format, and because #34 restores its producer.
 REASON(NonTrivialView)
 REASON(Asm)
 REASON(VarArgs)
