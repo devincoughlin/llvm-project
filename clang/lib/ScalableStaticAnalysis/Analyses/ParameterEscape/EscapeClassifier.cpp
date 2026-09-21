@@ -344,6 +344,13 @@ public:
     Memo.clear();
     UseVisitor V(*this);
     V.TraverseDecl(const_cast<FunctionDecl *>(Def));
+    // Implicit subobject destruction runs after the body, which is also where
+    // first-sink-wins wants it. Not guarded on Src.isThis(): a destructor has
+    // no parameters, so `this` is the only source it is ever analyzed for.
+    if (const auto *DD = dyn_cast<CXXDestructorDecl>(Def)) {
+      assert(Src.isThis() && "a destructor has no parameters");
+      classifySubobjectDestruction(DD);
+    }
     return Fact;
   }
 
@@ -912,6 +919,15 @@ private:
       // through a capture, and every capture of an alias has just sunk.
       return true;
     }
+    // The subobject a constructor initializer builds is reached before the
+    // initializer expression's own uses, which is where it happens in source
+    // order too -- and first-sink-wins reads that order.
+    bool TraverseConstructorInitializer(CXXCtorInitializer *Init) override {
+      if (Init && C.Src.isThis())
+        C.classifySubobjectConstruction(Init->getInit(),
+                                        Init->getSourceLocation());
+      return DynamicRecursiveASTVisitor::TraverseConstructorInitializer(Init);
+    }
     bool TraverseBlockExpr(BlockExpr *BE) override {
       for (const BlockDecl::Capture &Cap : BE->getBlockDecl()->captures())
         if (C.AliasVars.count(Cap.getVariable()))
@@ -1065,14 +1081,269 @@ private:
     for (const CXXCtorInitializer *CI : CD->inits()) {
       if (CI->getInit() != M)
         continue;
+      // A delegating initializer's own expression is a CXXConstructExpr of
+      // the class type, and its arguments are classified as an ordinary call
+      // (DelegatingInitializerIsAnOrdinaryCall) while the object it builds is
+      // recorded for `this` by classifySubobjectConstruction().
+      //
+      // No test pins this arm and none can today: reaching it needs that
+      // CXXConstructExpr to have an alias kind of its own, and kindOfCall()
+      // gives a prvalue one only when its type is pointer-carrying -- which no
+      // record type is since #12 took tracked views out. Weakening it alone to
+      // a sink leaves the whole suite green, which is how that was measured.
+      // It is kept rather than deleted because it is the arm that decides the
+      // shape if the pointer-carrying population ever grows again (#34), and
+      // because the alternative, falling through to the row below, would claim
+      // that delegating to another constructor stores into a field.
       if (CI->isDelegatingInitializer())
-        return; // the CXXConstructExpr's arguments are classified as a call
+        return;
       return sink(EscapeReason::StoreToField, Loc);
     }
     // An expression whose parent is a constructor but which is none of its
     // initializers -- a default member initializer evaluated here, for
     // instance. Unmodelled, so it sinks.
     sink(EscapeReason::UnrecognizedUse, Loc, "constructor initializer");
+  }
+
+  /// Record the implicit object argument of a constructor that one of the
+  /// analyzed definition's own constructor initializers runs.
+  ///
+  /// A base, member or delegating initializer calls a constructor on a
+  /// subobject of `*this` -- on `*this` itself, when delegating -- and design
+  /// section 1.1 counts a pointer to any subobject of the designated object as
+  /// derived from the source. The AST spells no operand for it: a
+  /// CXXConstructExpr carries arguments but no object expression, so
+  /// resolveCallSite() reports no ImplicitObjectArg and the use rules, which
+  /// only ever classify expressions, can never see it. Design section 6's
+  /// first invariant makes classification exhaustive over *expressions*, so
+  /// an implicit object argument with no expression falls outside it and has
+  /// to be recorded here rather than in classifyUse().
+  ///
+  /// Constructor initializers are one of exactly two such arguments. The
+  /// other is implicit subobject *destruction*, which has no AST node at all
+  /// -- not even a CXXConstructExpr to find -- and which
+  /// classifySubobjectDestruction() answers.
+  ///
+  /// Only for the `this` source. A *parameter* reaches the constructed
+  /// subobject only through the initializer's arguments, which the ordinary
+  /// call rules classify, and through the initializer's own expression, which
+  /// classifyCtorInitUse() answers.
+  ///
+  /// The arms below are computeKind()'s, restricted to the ones that can
+  /// deliver a *newly constructed* object rather than name an existing one.
+  /// Deliberately omitted, each because the object it yields is not the
+  /// subobject being initialized:
+  ///
+  ///  - the arms that denote an existing object -- DeclRefExpr, MemberExpr,
+  ///    ArraySubscriptExpr, UnaryOperator, assignment, pointer arithmetic.
+  ///    Initializing a member from one of those copies it, and the copy is a
+  ///    CXXConstructExpr wrapping them, which the last arm answers.
+  ///  - CXXDefaultArgExpr, which cannot be an initializer's own expression.
+  ///  - MaterializeTemporaryExpr and OpaqueValueExpr. A materialized temporary
+  ///    is never a subobject of `*this`, so an arm that descended into one
+  ///    would record a constructor that ran on something else. Measured on the
+  ///    one shape that puts them in this position, the GNU `a ?: b`: its true
+  ///    branch initializes the member by *copying* the materialized temporary,
+  ///    and that copy is a CXXConstructExpr the last arm answers -- skipped
+  ///    when trivial, recorded against the copy constructor when not.
+  ///    SubobjectConstructionValueShapes asserts exactly that, and asserts
+  ///    that the temporary's own constructor is *not* recorded.
+  ///  - CallExpr. `: m(makeM())` builds the member through the callee's
+  ///    return slot, and the analysis models no return slot anywhere (#38).
+  ///    This is *not* the same approximation as `M m = makeM();` in a
+  ///    statement, though the two are answered the same way: there the return
+  ///    slot is a local and `this` is genuinely unaffected, while here the
+  ///    return slot is a subobject of `*this`, so `this` genuinely escapes if
+  ///    the callee keeps a pointer to what it builds, and nothing records it.
+  void classifySubobjectConstruction(const Expr *E, SourceLocation InitLoc) {
+    if (!E)
+      return;
+    if (const auto *PE = dyn_cast<ParenExpr>(E))
+      return classifySubobjectConstruction(PE->getSubExpr(), InitLoc);
+    if (const auto *FE = dyn_cast<FullExpr>(E)) // ExprWithCleanups
+      return classifySubobjectConstruction(FE->getSubExpr(), InitLoc);
+    if (const auto *DIE = dyn_cast<CXXDefaultInitExpr>(E))
+      return classifySubobjectConstruction(DIE->getExpr(), InitLoc);
+    // A prvalue of a type with a destructor keeps its CXXBindTemporaryExpr
+    // here even where the copy is elided and the constructor builds the
+    // subobject in place. Looking through it can only add edges, and an
+    // argument -- the one place a genuine temporary appears -- is never
+    // reached, because no arm below descends into one.
+    if (const auto *BTE = dyn_cast<CXXBindTemporaryExpr>(E))
+      return classifySubobjectConstruction(BTE->getSubExpr(), InitLoc);
+    // `Leak(6)` with an argument list is a functional cast around the
+    // construction, where `Leak()` is a CXXTemporaryObjectExpr on its own.
+    // Only CK_ConstructorConversion: it alone names a constructor, and it
+    // constructs the object this initializer initializes.
+    if (const auto *CE = dyn_cast<CastExpr>(E);
+        CE && CE->getCastKind() == CK_ConstructorConversion)
+      return classifySubobjectConstruction(CE->getSubExpr(), InitLoc);
+    // An aggregate member or an array member initializes its own elements,
+    // each of which is a subobject of `*this` in turn.
+    if (const auto *ILE = dyn_cast<InitListExpr>(E)) {
+      for (const Expr *Init : ILE->inits())
+        classifySubobjectConstruction(Init, InitLoc);
+      return classifySubobjectConstruction(ILE->getArrayFiller(), InitLoc);
+    }
+    if (const auto *PLIE = dyn_cast<CXXParenListInitExpr>(E)) {
+      for (const Expr *Init : PLIE->getInitExprs())
+        classifySubobjectConstruction(Init, InitLoc);
+      return;
+    }
+    if (const auto *AILE = dyn_cast<ArrayInitLoopExpr>(E))
+      return classifySubobjectConstruction(AILE->getSubExpr(), InitLoc);
+    // Both branches: the analysis is flow-insensitive, and either may run.
+    // AbstractConditionalOperator rather than ConditionalOperator so that the
+    // GNU `a ?: b` spelling is answered by the same arm; its true branch is
+    // reached through the OpaqueValueExpr and MaterializeTemporaryExpr arms
+    // below.
+    if (const auto *CO = dyn_cast<AbstractConditionalOperator>(E)) {
+      classifySubobjectConstruction(CO->getTrueExpr(), InitLoc);
+      return classifySubobjectConstruction(CO->getFalseExpr(), InitLoc);
+    }
+    // Only the right operand carries the comma's value; the left one is
+    // discarded, and any construction in it builds a temporary.
+    if (const auto *BO = dyn_cast<BinaryOperator>(E);
+        BO && BO->getOpcode() == BO_Comma)
+      return classifySubobjectConstruction(BO->getRHS(), InitLoc);
+    // Asked exactly as computeKind() asks it, and for the same reason:
+    // ValueStmt::getExprStmt() is the query Sema::BuildStmtExpr() used to give
+    // the statement expression its type, so it looks through the LabelStmt and
+    // AttributedStmt wrappers that `({ lbl: M(); })` puts in the way. Taking
+    // body_back() as an Expr instead would miss a labelled last statement.
+    if (const auto *SE = dyn_cast<StmtExpr>(E)) {
+      const CompoundStmt *Body = SE->getSubStmt();
+      if (!Body->body_empty())
+        if (const auto *VS = dyn_cast<ValueStmt>(Body->body_back()))
+          return classifySubobjectConstruction(VS->getExprStmt(), InitLoc);
+      return;
+    }
+    if (const auto *CE = dyn_cast<ChooseExpr>(E))
+      return classifySubobjectConstruction(CE->getChosenSubExpr(), InitLoc);
+    if (const auto *GSE = dyn_cast<GenericSelectionExpr>(E)) {
+      // Mirrors computeKind()'s guard, and is unpinned there for the same
+      // reason: a dependent selection has no result to look at, and a
+      // definition in a dependent context is one this classifier is not asked
+      // about.
+      if (GSE->isResultDependent())
+        return;
+      return classifySubobjectConstruction(GSE->getResultExpr(), InitLoc);
+    }
+    const auto *CCE = dyn_cast<CXXConstructExpr>(E);
+    if (!CCE)
+      return;
+    const CXXConstructorDecl *Callee = CCE->getConstructor();
+    // A trivial constructor runs no code that could keep the object: a trivial
+    // default constructor performs no initialization at all, and a trivial
+    // copy or move constructor copies the *source* object's bytes into the
+    // subobject without ever forming a durable pointer to the destination.
+    // Recognized here for the same reason isTrivialImplicitCopyOrMove() is
+    // recognized at an ordinary call site -- these constructors are also the
+    // ones the entity model most often cannot name, so flowing into them would
+    // degrade to UnnamedCallee and make `this` escape out of every aggregate
+    // member.
+    if (Callee->isTrivial())
+      return;
+    SourceLocation Loc = CCE->getBeginLoc();
+    if (Loc.isInvalid())
+      Loc = InitLoc;
+    // Not a virtual call: a constructor is never virtual, so the body that
+    // runs is always this one. Arguments are left to the ordinary rules.
+    flowsTo(Callee, ThisParamIndex, Loc);
+  }
+
+  /// Record the implicit object argument of every destructor \p DD runs on one
+  /// of its own subobjects.
+  ///
+  /// The mirror of classifySubobjectConstruction(), and the second of the two
+  /// implicit object arguments the use rules can never see -- this one with
+  /// less to go on, because a base's or a member's destruction has no AST node
+  /// at all, not even a call expression. The subobjects are read off the class
+  /// instead.
+  ///
+  /// Unlike construction, this direction is reachable from an ordinary
+  /// candidate parameter today: `h->~Holder()` is a CXXMemberCallExpr, so
+  /// classifyCallUse() records `flowsTo(~Holder, ThisParamIndex)` from a
+  /// parameter, and `~Holder`'s own fact is what the fixpoint then reads. A
+  /// `~Holder` that reports clean with no edges is the shape that means
+  /// "provably does not escape", so a base destructor that publishes the
+  /// object it is destroying would let the caller's parameter be annotated
+  /// `noescape` -- which CodeGen lowers to `captures(none)`. That spelling is
+  /// what every pool allocator and slab uses; libc++'s own `__destroy_at` is
+  /// `p->~T()`.
+  ///
+  /// A destructor has no parameters, so `this` is its only source.
+  ///
+  /// The edges recorded here are only as good as the entity model's ability to
+  /// name the destructor at the other end, and an *implicit* destructor is
+  /// usually unnamable: `struct A { ~A(); }; struct B { A a; }; struct X { B
+  /// b; ~X() { } };` gives `~X` a sink of UnnamedCallee rather than a flow,
+  /// because `~B` is implicit. That is the safe direction -- it reports an
+  /// escape where a flow would have deferred the question -- but it means the
+  /// chain stays precise only while every intermediate class declares its
+  /// destructor. Widening what the entity model can name is not this
+  /// function's to do.
+  void classifySubobjectDestruction(const CXXDestructorDecl *DD) {
+    const CXXRecordDecl *RD = DD->getParent();
+    if (!RD || !RD->hasDefinition())
+      return;
+    RD = RD->getDefinition();
+
+    auto record = [&](QualType T, SourceLocation Loc) {
+      // An array member is destroyed element by element; the element type is
+      // what carries the destructor.
+      const CXXRecordDecl *Sub =
+          Ctx.getBaseElementType(T)->getAsCXXRecordDecl();
+      // Unreachable on well-formed input -- a base or a member of class type
+      // must be complete for the enclosing class to be defined -- but this
+      // extractor runs as an ASTConsumer whatever the diagnostics said, and
+      // clang's recovery keeps a FieldDecl whose type is still incomplete. All
+      // of `Inc m;`, `Inc m[2];` and `U<int> m;` reach here, and with this
+      // line removed getDefinition() answers null and hasTrivialDestructor()
+      // dereferences it: the process dies rather than the suite going red.
+      // IncompleteSubobjectsAreSkipped is what fires it.
+      if (!Sub || !Sub->hasDefinition())
+        return;
+      Sub = Sub->getDefinition();
+      // A trivial destructor runs no code, by the same argument that lets
+      // classifySubobjectConstruction() skip a trivial constructor -- and it
+      // is likewise the shape the entity model most often cannot name, so
+      // flowing into it would degrade to UnnamedCallee and make `this` escape
+      // out of every scalar member.
+      if (Sub->hasTrivialDestructor())
+        return;
+      // A separate claim from the one above, and a weaker one: this guard is
+      // pinned by nothing and no input has been found that fires it.
+      // getDestructor() declares the implicit destructor on demand, and a
+      // class that reaches this line has a non-trivial -- hence existing --
+      // one, so null would need a deleted, inaccessible or otherwise invalid
+      // destructor that hasTrivialDestructor() nonetheless called non-trivial.
+      // Incomplete, deleted, private, unnamed and C++20 constrained
+      // destructors with no eligible candidate were all measured and none
+      // reaches it. It stays because returning is the direction that cannot
+      // record an edge to nothing.
+      const CXXDestructorDecl *SubDD = Sub->getDestructor();
+      if (!SubDD)
+        return;
+      // A base subobject's destructor is called non-virtually even when it is
+      // virtual, so the body that runs is this one and a flow edge is exact.
+      flowsTo(SubDD, ThisParamIndex, Loc.isValid() ? Loc : DD->getLocation());
+    };
+
+    // Direct bases, then all virtual bases -- a direct virtual base is in
+    // both, and the duplicate edge is dropped by try_emplace.
+    for (const CXXBaseSpecifier &B : RD->bases())
+      record(B.getType(), B.getBeginLoc());
+    for (const CXXBaseSpecifier &B : RD->vbases())
+      record(B.getType(), B.getBeginLoc());
+    // A union's variant members are *not* destroyed implicitly, so an edge
+    // recorded for one describes a call that never happens. No arm excludes
+    // them: an edge too many can only report an escape that cannot occur,
+    // while an arm that excluded them would be one more thing to get right,
+    // and a union holding a non-trivially-destructible member needs a
+    // user-written destructor that destroys it by hand anyway.
+    for (const FieldDecl *F : RD->fields())
+      record(F->getType(), F->getLocation());
   }
 
   /// The table of design section 5.2, read top to bottom. \p M denotes

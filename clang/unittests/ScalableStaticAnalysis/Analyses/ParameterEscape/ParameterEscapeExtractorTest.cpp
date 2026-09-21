@@ -13,6 +13,7 @@
 #include "../../TestFixture.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
+#include "clang/AST/ParentMapContext.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Frontend/ASTUnit.h"
 #include "clang/Frontend/PCHContainerOperations.h"
@@ -258,6 +259,17 @@ protected:
   const EscapeFact *thisFactOfDecl(const FunctionDecl *FD) {
     const ParameterEscapeSummary *S = summaryOfDecl(FD);
     return S && S->This ? &*S->This : nullptr;
+  }
+
+  // The `this` sink reason, or nullopt when there is none. Fails the test if
+  // the declaration carries no `this` fact at all.
+  std::optional<EscapeReason> sinkOfThisDecl(const FunctionDecl *FD) {
+    const EscapeFact *F = thisFactOfDecl(FD);
+    if (!F) {
+      ADD_FAILURE() << "no `this` fact";
+      return std::nullopt;
+    }
+    return F->OtherSink ? std::optional(F->OtherSink->Reason) : std::nullopt;
   }
 
   const EscapeFact *thisFactOf(StringRef Fn) {
@@ -1804,6 +1816,632 @@ TEST_F(ParameterEscapeExtractorTest, ThisIsAnAliasSource) {
   ASSERT_TRUE(Offset && Offset->OtherSink);
   EXPECT_EQ(Offset->OtherSink->Reason, EscapeReason::StoreToGlobal);
   EXPECT_TRUE(thisFactOf("self")->returnsSelf());
+}
+
+//===--- Constructor initializers -----------------------------------------===//
+
+// A base initializer is an ordinary call: its arguments are paired with the
+// base constructor's parameters by position, and the escape is expressed by
+// the base constructor's own facts rather than by a sink here.
+//
+// The pairing is asserted crosswise -- D's `p` is Base's `y` and D's `q` is
+// Base's `x` -- and negatively as well as positively, so that pairing every
+// argument to index 0, or swapping the two, cannot pass.
+TEST_F(ParameterEscapeExtractorTest, BaseInitializerIsAnOrdinaryCall) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct Base { int *a; int *b; Base(int *x, int *y) : a(y), b(x) { } };
+    struct D : Base { int n; D(int *p, int *q) : Base(q, p), n(0) { } };
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const CXXConstructorDecl *BC = ctorOf("Base", 2);
+  const CXXConstructorDecl *DC = ctorOf("D", 2);
+  ASSERT_NE(BC, nullptr);
+  ASSERT_NE(DC, nullptr);
+  const EscapeFact *P = factOfDecl(DC, 0);
+  const EscapeFact *Q = factOfDecl(DC, 1);
+  ASSERT_NE(P, nullptr);
+  ASSERT_NE(Q, nullptr);
+  EXPECT_TRUE(flowsToDecl(P, BC, 1));
+  EXPECT_TRUE(flowsToDecl(Q, BC, 0));
+  EXPECT_FALSE(flowsToDecl(P, BC, 0));
+  EXPECT_FALSE(flowsToDecl(Q, BC, 1));
+  // One edge each: a use classified twice, or an argument also read as the
+  // implicit object, would show up here.
+  EXPECT_EQ(P->FlowsTo.size(), 1u);
+  EXPECT_EQ(Q->FlowsTo.size(), 1u);
+  EXPECT_EQ(sinkOfDecl(DC, 0), std::nullopt);
+  EXPECT_EQ(sinkOfDecl(DC, 1), std::nullopt);
+  // The escape is expressed one node along, by the base's own facts.
+  EXPECT_EQ(sinkOfDecl(BC, 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOfDecl(BC, 1), EscapeReason::StoreToField);
+  // Building the base subobject hands `this` to the base constructor; see
+  // SubobjectConstructorsReceiveThis below. Nothing else touches it, and the
+  // base constructor's own `this` is clean, so the fixpoint closes clean.
+  const EscapeFact *T = thisFactOfDecl(DC);
+  ASSERT_NE(T, nullptr);
+  EXPECT_FALSE(T->OtherSink.has_value());
+  EXPECT_TRUE(flowsToDecl(T, BC, ThisParamIndex));
+  EXPECT_TRUE(isClean(thisFactOfDecl(BC)));
+}
+
+// A delegating initializer is the same ordinary call, to a sibling
+// constructor rather than to a base's.
+TEST_F(ParameterEscapeExtractorTest, DelegatingInitializerIsAnOrdinaryCall) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct G { int *p; G(int *x, int *y) : p(x) { (void)y; }
+               G(int *a) : G(nullptr, a) { } };
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const CXXConstructorDecl *Two = ctorOf("G", 2);
+  const CXXConstructorDecl *One = ctorOf("G", 1);
+  ASSERT_NE(Two, nullptr);
+  ASSERT_NE(One, nullptr);
+  const EscapeFact *A = factOfDecl(One, 0);
+  ASSERT_NE(A, nullptr);
+  // `a` is the delegate's *second* parameter, and its first parameter is the
+  // one that escapes -- so a pairing that ignored position would report a
+  // sink one node along instead of a clean fact.
+  EXPECT_TRUE(flowsToDecl(A, Two, 1));
+  EXPECT_FALSE(flowsToDecl(A, Two, 0));
+  EXPECT_EQ(A->FlowsTo.size(), 1u);
+  EXPECT_EQ(sinkOfDecl(One, 0), std::nullopt);
+  EXPECT_EQ(sinkOfDecl(Two, 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOfDecl(Two, 1), std::nullopt);
+}
+
+// A member initializer appears in no statement: ParentMapContext models no
+// CXXCtorInitializer, so the parent of the initializer's expression is the
+// CXXConstructorDecl itself. The first two assertions pin that directly --
+// without them, "the containment rules hold here" would be an inference from
+// the outcomes rather than a statement about the shape.
+//
+// The outcomes then show the ordinary containment rules running under that
+// parent: an expression nested inside the initializer is covered by its own
+// parent and classified once, and only the initializer's top-level expression
+// reaches the constructor row.
+TEST_F(ParameterEscapeExtractorTest,
+       ConstructorInitializerParentIsTheConstructor) {
+  ASSERT_TRUE(setUp(R"cpp(
+    int *id(int *);
+    struct Nest { int *p; int *q;
+      Nest(int *a, int *b) : p(a + 1), q(id(b)) { } };
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const CXXConstructorDecl *CD = ctorOf("Nest", 2);
+  ASSERT_NE(CD, nullptr);
+  ASTContext &Ctx = AST->getASTContext();
+  ASSERT_NE(CD->init_begin(), CD->init_end());
+  const CXXCtorInitializer *First = *CD->init_begin();
+  ASSERT_NE(First->getInit(), nullptr);
+  DynTypedNodeList Parents =
+      Ctx.getParentMapContext().getParents(*First->getInit());
+  ASSERT_EQ(Parents.size(), 1u);
+  EXPECT_EQ(Parents[0].get<CXXConstructorDecl>(), CD)
+      << "the parent is the constructor";
+  EXPECT_EQ(Parents[0].get<Stmt>(), nullptr)
+      << "and not an enclosing statement";
+
+  // `a + 1` is a value alias whose operand is covered by the arithmetic; only
+  // the sum reaches the constructor row, as one store into `p`.
+  const EscapeFact *FA = factOfDecl(CD, 0);
+  ASSERT_NE(FA, nullptr);
+  ASSERT_TRUE(FA->OtherSink.has_value());
+  EXPECT_EQ(FA->OtherSink->Reason, EscapeReason::StoreToField);
+  EXPECT_TRUE(FA->FlowsTo.empty());
+  // `id(b)` records the argument's flow *and* the store of the result, so the
+  // initializer's expression and the expression nested in it are both
+  // classified, each by its own rule.
+  const EscapeFact *FB = factOfDecl(CD, 1);
+  ASSERT_NE(FB, nullptr);
+  EXPECT_TRUE(flowsToDecl(FB, findFnByName("id", Ctx), 0));
+  EXPECT_EQ(FB->FlowsTo.size(), 1u);
+  ASSERT_TRUE(FB->OtherSink.has_value());
+  EXPECT_EQ(FB->OtherSink->Reason, EscapeReason::StoreToField);
+}
+
+// Every constructor initializer that runs a constructor hands that
+// constructor a pointer to a subobject of `*this` -- to `*this` itself, when
+// delegating -- and design section 1.1 counts a pointer to any subobject as
+// derived from the source. A CXXConstructExpr spells no object operand, so
+// this is the one implicit object argument with no expression for the use
+// rules to classify; without classifySubobjectConstruction() a base
+// constructor that publishes `this` leaves the derived constructor's `this`
+// reading clean.
+TEST_F(ParameterEscapeExtractorTest, SubobjectConstructorsReceiveThis) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct Base { Base(); };
+    struct Mem { Mem(); };
+    struct Plain { int x; };
+    Base *g_b; Mem *g_m;
+    Base::Base() { g_b = this; }
+    Mem::Mem() { g_m = this; }
+    struct D : Base   { D(int *p) : Base() { (void)p; } };
+    struct M { Mem m; M(int *p) : m() { (void)p; } };
+    struct Del { Del(); Del(int *p) : Del() { (void)p; } };
+    struct Triv { Plain a; Triv(int *p) : a() { (void)p; } };
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const CXXConstructorDecl *BaseC = ctorOf("Base", 0);
+  const CXXConstructorDecl *MemC = ctorOf("Mem", 0);
+  ASSERT_NE(BaseC, nullptr);
+  ASSERT_NE(MemC, nullptr);
+  // Each constructor publishes the object it is building.
+  EXPECT_EQ(sinkOfThisDecl(BaseC), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOfThisDecl(MemC), EscapeReason::StoreToGlobal);
+
+  const CXXConstructorDecl *DC = ctorOf("D", 1);
+  ASSERT_NE(DC, nullptr);
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(DC), BaseC, ThisParamIndex))
+      << "a base subobject";
+  const CXXConstructorDecl *MC = ctorOf("M", 1);
+  ASSERT_NE(MC, nullptr);
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(MC), MemC, ThisParamIndex))
+      << "a member subobject";
+  const CXXConstructorDecl *DelOne = ctorOf("Del", 1);
+  const CXXConstructorDecl *DelZero = ctorOf("Del", 0);
+  ASSERT_NE(DelOne, nullptr);
+  ASSERT_NE(DelZero, nullptr);
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(DelOne), DelZero, ThisParamIndex))
+      << "`*this` itself, when delegating";
+  // The parameters are untouched by any of it: the object argument is not an
+  // argument, so nothing is attributed to them.
+  for (const CXXConstructorDecl *C : {DC, MC, DelOne})
+    EXPECT_TRUE(isClean(factOfDecl(C, 0))) << C->getParent()->getNameAsString();
+
+  // A trivial constructor runs no code that could keep the object, and is
+  // also the shape the entity model most often cannot name -- flowing into it
+  // would degrade to UnnamedCallee and make `this` escape out of every
+  // aggregate member.
+  const CXXConstructorDecl *TrivC = ctorOf("Triv", 1);
+  ASSERT_NE(TrivC, nullptr);
+  EXPECT_TRUE(isClean(thisFactOfDecl(TrivC)));
+}
+
+// Each arm of classifySubobjectConstruction() that unwraps an initializer's
+// expression down to the constructor running on the subobject. Every arm is
+// reached by exactly one of these structs, against a `Leak` whose three
+// constructors all publish the object being built. The expected callee differs
+// per arm wherever the shape allows it, so an arm that answered some other
+// constructor -- or that fell through to another arm -- would not pass.
+TEST_F(ParameterEscapeExtractorTest, SubobjectConstructionShapes) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct Leak { Leak(); Leak(int); Leak(const Leak &); ~Leak(); };
+    Leak *g_l;
+    Leak::Leak()              { g_l = this; }
+    Leak::Leak(int)           { g_l = this; }
+    Leak::Leak(const Leak &)  { g_l = this; }
+    struct Agg { Leak a; Leak b; };
+    struct Plain { int x; };
+    // CXXConstructExpr, written.
+    struct S1 { Leak m;      S1(int *p) : m(1) { (void)p; } };
+    // CXXDefaultInitExpr wrapping ExprWithCleanups: an implicit member
+    // initializer built from a default member initializer.
+    struct S2 { Leak m = Leak(2); S2(int *p) { (void)p; } };
+    // InitListExpr: an aggregate member's elements.
+    struct S3 { Agg g;       S3(int *p) : g{} { (void)p; } };
+    // CXXParenListInitExpr under ExprWithCleanups (C++20 paren aggregate
+    // init), whose elements are CXXBindTemporaryExpr-wrapped.
+    struct S4 { Agg g;       S4(int *p) : g(Leak(3), Leak(4)) { (void)p; } };
+    // A CXXConstructExpr of array type: all elements at once.
+    struct S5 { Leak arr[2]; S5(int *p) : arr() { (void)p; } };
+    // InitListExpr with both a written element (through
+    // CXXBindTemporaryExpr) and an array filler, which take different
+    // constructors so that neither can stand in for the other.
+    struct S6 { Leak arr[3]; S6(int *p) : arr{Leak(5)} { (void)p; } };
+    // ParenExpr.
+    struct S7 { Leak m;      S7(int *p) : m((Leak(6))) { (void)p; } };
+    // ArrayInitLoopExpr, which only a defaulted copy constructor produces.
+    struct S8 { Leak arr[2]; S8(const S8 &) = default; S8(int *p) { (void)p; } };
+    void odr_use(const S8 &a) { S8 b = a; (void)b; }
+    // A trivial constructor: no arm records it.
+    struct S9 { Plain a;     S9(int *p) : a() { (void)p; } };
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const CXXConstructorDecl *Default = ctorOf("Leak", 0);
+  ASSERT_NE(Default, nullptr);
+  const auto *RD = findDeclByName<CXXRecordDecl>("Leak", AST->getASTContext());
+  ASSERT_NE(RD, nullptr);
+  const CXXConstructorDecl *FromInt = nullptr, *Copy = nullptr;
+  for (const CXXConstructorDecl *C : RD->getDefinition()->ctors()) {
+    if (C->isImplicit() || C->getNumParams() != 1)
+      continue;
+    if (C->isCopyConstructor())
+      Copy = C;
+    else
+      FromInt = C;
+  }
+  ASSERT_NE(FromInt, nullptr);
+  ASSERT_NE(Copy, nullptr);
+  // All three publish the object they are building, so each is a node worth
+  // reaching.
+  EXPECT_EQ(sinkOfThisDecl(Default), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOfThisDecl(FromInt), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOfThisDecl(Copy), EscapeReason::StoreToGlobal);
+
+  struct Case {
+    const char *Class;
+    const CXXConstructorDecl *Callee;
+  };
+  // The written-element/filler pair of S6 is checked separately below.
+  for (auto [Class, Callee] : std::vector<Case>{{"S1", FromInt},
+                                                {"S2", FromInt},
+                                                {"S3", Default},
+                                                {"S4", FromInt},
+                                                {"S5", Default},
+                                                {"S7", FromInt}}) {
+    const CXXConstructorDecl *CD = ctorOf(Class, 1);
+    ASSERT_NE(CD, nullptr) << Class;
+    const EscapeFact *T = thisFactOfDecl(CD);
+    ASSERT_NE(T, nullptr) << Class;
+    EXPECT_TRUE(flowsToDecl(T, Callee, ThisParamIndex)) << Class;
+    EXPECT_FALSE(T->OtherSink.has_value()) << Class;
+    // The parameter is not the object argument.
+    EXPECT_TRUE(isClean(factOfDecl(CD, 0))) << Class;
+  }
+  // S6 reaches both: the written element through CXXBindTemporaryExpr and the
+  // filler through InitListExpr::getArrayFiller().
+  const CXXConstructorDecl *S6 = ctorOf("S6", 1);
+  ASSERT_NE(S6, nullptr);
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(S6), FromInt, ThisParamIndex))
+      << "the written element";
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(S6), Default, ThisParamIndex))
+      << "the array filler";
+  // S8's array member is copied element by element by the defaulted copy
+  // constructor, which is the only producer of an ArrayInitLoopExpr.
+  const auto *S8RD = findDeclByName<CXXRecordDecl>("S8", AST->getASTContext());
+  ASSERT_NE(S8RD, nullptr);
+  const CXXConstructorDecl *S8Copy = nullptr;
+  for (const CXXConstructorDecl *C : S8RD->getDefinition()->ctors())
+    if (C->isCopyConstructor())
+      S8Copy = C;
+  ASSERT_NE(S8Copy, nullptr);
+  ASSERT_TRUE(S8Copy->doesThisDeclarationHaveABody())
+      << "the defaulted copy constructor must be defined for this to mean "
+         "anything";
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(S8Copy), Copy, ThisParamIndex));
+  // A trivial constructor runs no code; nothing is recorded for it.
+  const CXXConstructorDecl *S9 = ctorOf("S9", 1);
+  ASSERT_NE(S9, nullptr);
+  EXPECT_TRUE(isClean(thisFactOfDecl(S9)));
+}
+
+// The mirror of SubobjectConstructorsReceiveThis, and the direction that is
+// reachable from a candidate parameter today: `h->~Holder()` is a
+// CXXMemberCallExpr, so an ordinary parameter flows into `~Holder`'s `this`,
+// and `~Holder` implicitly destroys its base without any expression saying so.
+// Before classifySubobjectDestruction(), `~Holder` reported clean with no
+// edges -- the shape that means "provably does not escape" -- and `recycle`'s
+// `h` would have been annotated `noescape` while the call publishes it.
+TEST_F(ParameterEscapeExtractorTest, SubobjectDestructorsReceiveThis) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct Registry;
+    struct Node { Registry *r; Node(Registry *rr); ~Node(); };
+    struct Plain { int x; };
+    Node *g_last;
+    Node::Node(Registry *rr) : r(rr) { }
+    Node::~Node() { g_last = this; }
+    struct Holder : Node { Holder(Registry *r) : Node(r) { } ~Holder() { } };
+    struct Member { Node n; Member(Registry *r) : n(r) { } ~Member() { } };
+    struct Arrayed { Node a[2]; Arrayed(Registry *r) : a{Node(r), Node(r)} { } ~Arrayed() { } };
+    struct VBase : virtual Node { VBase(Registry *r) : Node(r) { } ~VBase() { } };
+    struct VDerived : VBase { VDerived(Registry *r) : Node(r), VBase(r) { } ~VDerived() { } };
+    struct Triv { Plain p; int n; ~Triv() { } };
+    void recycle(Holder *h) { h->~Holder(); }
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  ASTContext &Ctx = AST->getASTContext();
+  auto dtorOf = [&](StringRef Class) -> const CXXDestructorDecl * {
+    const auto *RD = findDeclByName<CXXRecordDecl>(Class, Ctx);
+    if (!RD || !RD->getDefinition()) {
+      ADD_FAILURE() << "no class " << Class;
+      return nullptr;
+    }
+    return RD->getDefinition()->getDestructor();
+  };
+  const CXXDestructorDecl *NodeD = dtorOf("Node");
+  ASSERT_NE(NodeD, nullptr);
+  EXPECT_EQ(sinkOfThisDecl(NodeD), EscapeReason::StoreToGlobal);
+
+  // A base subobject, a member subobject, an array member's elements, and a
+  // direct virtual base.
+  for (const char *Class : {"Holder", "Member", "Arrayed", "VBase"}) {
+    const CXXDestructorDecl *DD = dtorOf(Class);
+    ASSERT_NE(DD, nullptr) << Class;
+    const EscapeFact *T = thisFactOfDecl(DD);
+    ASSERT_NE(T, nullptr) << Class;
+    EXPECT_TRUE(flowsToDecl(T, NodeD, ThisParamIndex)) << Class;
+    EXPECT_FALSE(T->OtherSink.has_value()) << Class;
+  }
+  // An *indirect* virtual base, which only the most-derived object destroys.
+  // It is in VDerived's vbases() and in nobody's bases(), so it is the one
+  // subobject the direct-base loop cannot reach -- without it, dropping the
+  // vbases() loop changes nothing measurable.
+  const CXXDestructorDecl *VBaseD = dtorOf("VBase");
+  const CXXDestructorDecl *VDerivedD = dtorOf("VDerived");
+  ASSERT_NE(VBaseD, nullptr);
+  ASSERT_NE(VDerivedD, nullptr);
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(VDerivedD), VBaseD, ThisParamIndex))
+      << "the direct base";
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(VDerivedD), NodeD, ThisParamIndex))
+      << "the indirect virtual base";
+
+  // The parameter that reaches the destructor: the edge into `~Holder`'s
+  // `this` already existed, and it is the fact behind it that was wrong.
+  const CXXDestructorDecl *HolderD = dtorOf("Holder");
+  ASSERT_NE(HolderD, nullptr);
+  EXPECT_TRUE(flowsToDecl(factOf("recycle", 0), HolderD, ThisParamIndex));
+  const ParameterEscapeSummary *R = summaryOf("recycle");
+  ASSERT_NE(R, nullptr);
+  EXPECT_EQ(R->CandidateParams, (std::set<unsigned>{0}))
+      << "no M1 exclusion saves this one";
+
+  // A class with only trivially-destructible subobjects records nothing: a
+  // trivial destructor runs no code, and is also the shape the entity model
+  // most often cannot name.
+  const CXXDestructorDecl *TrivD = dtorOf("Triv");
+  ASSERT_NE(TrivD, nullptr);
+  EXPECT_TRUE(isClean(thisFactOfDecl(TrivD)));
+}
+
+// The error-recovery half of classifySubobjectDestruction(): a subobject whose
+// record has no definition.
+//
+// Unreachable on well-formed input -- a base or a member of class type must be
+// complete for the enclosing class to be defined -- but this extractor runs as
+// an ASTConsumer whatever the diagnostics said, and clang's recovery keeps the
+// FieldDecl with its incomplete type. All three spellings below reach the
+// guard. Without it, getDefinition() returns null and hasTrivialDestructor()
+// dereferences it: the test process does not fail, it dies.
+TEST_F(ParameterEscapeExtractorTest, IncompleteSubobjectsAreSkipped) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct Inc;
+    template <class T> struct U;
+    struct Good { Good(); ~Good(); };
+    struct ByValue    { Inc m;     ~ByValue() { } };
+    struct ByArray    { Inc m[2];  ~ByArray() { } };
+    struct BySpecial  { U<int> m;  ~BySpecial() { } };
+    struct Mixed      { Inc bad; Good good; ~Mixed() { } };
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false, /*Files=*/{},
+                    /*ExpectedError=*/"incomplete type"));
+  auto dtorOf = [&](StringRef Class) -> const CXXDestructorDecl * {
+    const auto *RD = findDeclByName<CXXRecordDecl>(Class, AST->getASTContext());
+    if (!RD || !RD->getDefinition()) {
+      ADD_FAILURE() << "no class " << Class;
+      return nullptr;
+    }
+    return RD->getDefinition()->getDestructor();
+  };
+  // The unusable subobject is skipped rather than answered.
+  for (const char *Class : {"ByValue", "ByArray", "BySpecial"}) {
+    const CXXDestructorDecl *DD = dtorOf(Class);
+    ASSERT_NE(DD, nullptr) << Class;
+    EXPECT_TRUE(isClean(thisFactOfDecl(DD))) << Class;
+  }
+  // Only that one subobject: a complete member in the same class still gets
+  // its edge, so this cannot be read as "an erroneous class is abandoned".
+  const CXXDestructorDecl *MixedD = dtorOf("Mixed");
+  const CXXDestructorDecl *GoodD = dtorOf("Good");
+  ASSERT_NE(MixedD, nullptr);
+  ASSERT_NE(GoodD, nullptr);
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(MixedD), GoodD, ThisParamIndex));
+}
+
+// The value-delivering arms classifySubobjectConstruction() takes from
+// computeKind(): a conditional (both branches, since the analysis is
+// flow-insensitive), a comma, a statement expression, `__builtin_choose_expr`,
+// `_Generic` (twice, once behind a label), and the GNU `a ?: b` spelling.
+// Each shape's operands take
+// constructors the others do not, so an arm that answered the wrong operand
+// would not pass.
+//
+// C7 puts a label in front of a statement expression's value, which is what
+// separates ValueStmt::getExprStmt() from body_back().
+//
+// C6 is also where the two omitted arms are measured. The GNU conditional
+// materializes its common operand as a *temporary* and initializes the member
+// by copying it, so the object `Leak(6)` builds is not a subobject of `*this`:
+// the copy constructor is what runs on the member, and descending through the
+// MaterializeTemporaryExpr and OpaqueValueExpr into the temporary's own
+// constructor would record an edge for a call that never touches `*this`.
+TEST_F(ParameterEscapeExtractorTest, SubobjectConstructionValueShapes) {
+  // The three extensions this test spells, muted so that the input is clean.
+  std::vector<std::string> Args = {
+      "-std=c++20", "-Wno-gnu-statement-expression", "-Wno-c11-extensions",
+      "-Wno-gnu-conditional-omitted-operand"};
+  ASSERT_TRUE(setUp(R"cpp(
+    struct Leak { Leak(); Leak(int); Leak(const Leak &); ~Leak();
+                  explicit operator bool() const; };
+    Leak *g_l;
+    Leak::Leak()             { g_l = this; }
+    Leak::Leak(int)          { g_l = this; }
+    Leak::Leak(const Leak &) { g_l = this; }
+    struct C1 { Leak m; C1(int *p) : m(p ? Leak(1) : Leak()) { } };
+    struct C2 { Leak m; C2(int *p) : m(((void)0, Leak(2))) { (void)p; } };
+    struct C3 { Leak m; C3(int *p) : m(({ Leak(3); })) { (void)p; } };
+    struct C4 { Leak m; C4(int *p) : m(__builtin_choose_expr(1, Leak(4), Leak())) { (void)p; } };
+    struct C5 { Leak m; C5(int *p) : m(_Generic(0, int: Leak(5))) { (void)p; } };
+    struct C6 { Leak m; C6(int *p) : m(Leak(6) ?: Leak()) { (void)p; } };
+    struct C7 { Leak m; C7(int *p) : m(({ lbl: Leak(7); })) { (void)p; } };
+  )cpp",
+                    Args, /*WithPrelude=*/false));
+  const auto *RD = findDeclByName<CXXRecordDecl>("Leak", AST->getASTContext());
+  ASSERT_NE(RD, nullptr);
+  const CXXConstructorDecl *Default = nullptr, *FromInt = nullptr,
+                           *Copy = nullptr;
+  for (const CXXConstructorDecl *C : RD->getDefinition()->ctors()) {
+    if (C->isImplicit())
+      continue;
+    if (C->getNumParams() == 0)
+      Default = C;
+    else if (C->isCopyConstructor())
+      Copy = C;
+    else
+      FromInt = C;
+  }
+  ASSERT_NE(Default, nullptr);
+  ASSERT_NE(FromInt, nullptr);
+  ASSERT_NE(Copy, nullptr);
+  // Every shape but the GNU conditional constructs the member in place from
+  // its `Leak(n)` operand.
+  // C7's last statement is a LabelStmt, so only ValueStmt::getExprStmt()
+  // finds the value -- the same distinction computeKind()'s StmtExpr arm
+  // makes, and StatementExpressionPropagatesThroughALabel pins for it.
+  for (const char *Class : {"C1", "C2", "C3", "C4", "C5", "C7"}) {
+    const CXXConstructorDecl *CD = ctorOf(Class, 1);
+    ASSERT_NE(CD, nullptr) << Class;
+    const EscapeFact *T = thisFactOfDecl(CD);
+    ASSERT_NE(T, nullptr) << Class;
+    EXPECT_TRUE(flowsToDecl(T, FromInt, ThisParamIndex)) << Class;
+    EXPECT_FALSE(T->OtherSink.has_value()) << Class;
+  }
+  // A conditional takes both branches; `__builtin_choose_expr` takes only the
+  // chosen one, which is what separates the two arms.
+  EXPECT_TRUE(
+      flowsToDecl(thisFactOfDecl(ctorOf("C1", 1)), Default, ThisParamIndex))
+      << "the false branch of a conditional";
+  EXPECT_FALSE(
+      flowsToDecl(thisFactOfDecl(ctorOf("C4", 1)), Default, ThisParamIndex))
+      << "the unchosen operand of __builtin_choose_expr is not evaluated";
+  // The GNU conditional: the false branch builds the member directly, the
+  // true branch copies a temporary into it, and the temporary's own
+  // constructor is not a constructor of any subobject of `*this`.
+  const CXXConstructorDecl *C6 = ctorOf("C6", 1);
+  ASSERT_NE(C6, nullptr);
+  const EscapeFact *T6 = thisFactOfDecl(C6);
+  ASSERT_NE(T6, nullptr);
+  EXPECT_TRUE(flowsToDecl(T6, Default, ThisParamIndex)) << "the false branch";
+  EXPECT_TRUE(flowsToDecl(T6, Copy, ThisParamIndex)) << "the true branch";
+  EXPECT_FALSE(flowsToDecl(T6, FromInt, ThisParamIndex))
+      << "the materialized temporary is not a subobject";
+  EXPECT_FALSE(T6->OtherSink.has_value());
+}
+
+//===--- `this` in an ordinary member function ----------------------------===//
+
+// What a member function may do with `this` and stay clean, and what it may
+// not. The `leak_field` row is the one that changed with #12: while views
+// were tracked, a load out of a field of `*this` was an alias of `this`; now
+// it is an ordinary load through a place, which design section 1.1 and
+// invariant 8 make fresh, so storing it leaks the *field's* value and not the
+// object's address. `leak_field_addr` is the shape that does escape, and the
+// two sit together so that neither can be read as the other.
+TEST_F(ParameterEscapeExtractorTest, MemberFunctionUsesOfThis) {
+  ASSERT_TRUE(setUp(R"cpp(
+    int *g_ptr;
+    struct T { int *m; int n; int arr[4];
+      void set(int *p)        { m = p; n = 1; }
+      void set_explicit(int *p) { this->m = p; }
+      int  scalars()          { return n + arr[0] + *m; }
+      void leak_field()       { g_ptr = m; }
+      void leak_field_addr()  { g_ptr = &n; }
+      int *ret_derived()      { return &n; }
+      int *ret_decay()        { return arr; }
+      T   *ret_this()         { return this; } };
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  // `this` as the base of a member store is benign for `this`; the stored
+  // value is what escapes. Both spellings, since the implicit one reaches the
+  // member through a CXXThisExpr the source never wrote.
+  EXPECT_TRUE(isClean(thisFactOf("set")));
+  EXPECT_EQ(sinkOf("set", 0), EscapeReason::StoreToField);
+  EXPECT_TRUE(isClean(thisFactOf("set_explicit")));
+  EXPECT_EQ(sinkOf("set_explicit", 0), EscapeReason::StoreToField);
+  // Reading scalars out of the object, including through a pointer field.
+  EXPECT_TRUE(isClean(thisFactOf("scalars")));
+  // Loads are fresh (design invariant 8): the field's value is not the
+  // object's address.
+  EXPECT_TRUE(isClean(thisFactOf("leak_field")));
+  // Its address is.
+  const EscapeFact *A = thisFactOf("leak_field_addr");
+  ASSERT_TRUE(A && A->OtherSink);
+  EXPECT_EQ(A->OtherSink->Reason, EscapeReason::StoreToGlobal);
+  // Returning `this`, or a pointer derived from it -- the address of a member
+  // and an array member's decay -- is ReturnsSelf.
+  for (const char *Fn : {"ret_this", "ret_derived", "ret_decay"}) {
+    const EscapeFact *R = thisFactOf(Fn);
+    ASSERT_NE(R, nullptr) << Fn;
+    EXPECT_TRUE(R->returnsSelf()) << Fn;
+    EXPECT_FALSE(R->OtherSink.has_value()) << Fn;
+  }
+}
+
+//===--- The view exclusion -----------------------------------------------===//
+
+// #12 made a view-typed parameter non-pointer-carrying, so it carries no fact
+// and is never a candidate. The `[[gsl::Pointer]]` and `swift_attr` spellings
+// are pinned by ViewTypedParametersDropOutByValueAndByReference; these are the
+// standard-library ones, whose attribute Sema infers from the name in
+// inferGslPointerAttribute() rather than from a spelling in the source -- a
+// different path into the same predicate, and the one a real translation unit
+// takes.
+//
+// By value is not the interesting shape: no record type is pointer-carrying,
+// so a view drops out there for the same reason a std::vector does. The
+// shapes that isViewRecordType() alone decides are the reference and the
+// pointer, and both are asserted, against a std::vector in the same position
+// as the control that keeps them honest.
+TEST_F(ParameterEscapeExtractorTest, StandardViewTypedParametersCarryNoFact) {
+  ASSERT_TRUE(setUp(R"cpp(
+    namespace std {
+      template <class T> class span { public: T *d; unsigned n; };
+      template <class C> class basic_string_view { public: const C *d; unsigned n; };
+      using string_view = basic_string_view<char>;
+      template <class T> class vector { public: T *d; };
+    }
+    void by_value(std::span<int> s, std::string_view sv, std::vector<int> v, int *keep) { }
+    void by_ref(std::span<int> &s, const std::string_view &sv, std::vector<int> &v, int *keep) { }
+    void by_ptr(std::span<int> *s, std::string_view *sv, std::vector<int> *v, int *keep) { }
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  // No record type is pointer-carrying, so the view and the owner alike drop
+  // out by value. This row claims nothing about the view predicate.
+  const ParameterEscapeSummary *V = summaryOf("by_value");
+  ASSERT_NE(V, nullptr);
+  EXPECT_EQ(analyzedParamsOf("by_value"), (std::set<unsigned>{3}));
+  EXPECT_EQ(V->CandidateParams, (std::set<unsigned>{3}));
+  // A reference to a view is refused with the view; a reference to an owner
+  // is an ordinary reference, analyzed and annotatable.
+  const ParameterEscapeSummary *R = summaryOf("by_ref");
+  ASSERT_NE(R, nullptr);
+  EXPECT_EQ(analyzedParamsOf("by_ref"), (std::set<unsigned>{2, 3}));
+  EXPECT_EQ(R->CandidateParams, (std::set<unsigned>{2, 3}));
+  // A pointer to a view keeps its fact -- callers read it -- and leaves
+  // candidacy alone.
+  const ParameterEscapeSummary *P = summaryOf("by_ptr");
+  ASSERT_NE(P, nullptr);
+  EXPECT_EQ(analyzedParamsOf("by_ptr"), (std::set<unsigned>{0, 1, 2, 3}));
+  EXPECT_EQ(P->CandidateParams, (std::set<unsigned>{2, 3}));
+}
+
+// The member-initializer form of AliasesReachingAViewStillSink: a view built
+// in a constructor initializer is an ordinary constructor call, so the alias
+// does not get away -- it reaches the sink through the view constructor's own
+// facts rather than through any view tracking.
+//
+// The issue this test answers predicted a StoreToField sink on `p` itself.
+// That is what the tracked-view model produced, where constructing a view was
+// a field store; measured against the model #12 left behind, the store is one
+// node along, in View's constructor.
+TEST_F(ParameterEscapeExtractorTest, ViewMemberInitializerReachesTheSink) {
+  ASSERT_TRUE(setUp("struct H2 { View v; H2(int *p) : v(p, 1) { } };"));
+  const CXXConstructorDecl *H2C = ctorOf("H2", 1);
+  const CXXConstructorDecl *VC = ctorOf("View", 2);
+  ASSERT_NE(H2C, nullptr);
+  ASSERT_NE(VC, nullptr);
+  const EscapeFact *P = factOfDecl(H2C, 0);
+  ASSERT_NE(P, nullptr);
+  EXPECT_FALSE(P->OtherSink.has_value());
+  EXPECT_TRUE(flowsToDecl(P, VC, 0));
+  // Exactly one edge: the subobject's implicit object argument belongs to
+  // `this`, not to `p`, so a rule that attributed it to every source would
+  // show up here as a second edge into View's `this`.
+  EXPECT_EQ(P->FlowsTo.size(), 1u);
+  EXPECT_FALSE(flowsToDecl(P, VC, ThisParamIndex));
+  // And the escape is expressed, one node along.
+  EXPECT_EQ(sinkOfDecl(VC, 0), EscapeReason::StoreToField);
+  // `this` is what receives the subobject.
+  EXPECT_TRUE(flowsToDecl(thisFactOfDecl(H2C), VC, ThisParamIndex));
 }
 
 } // namespace
