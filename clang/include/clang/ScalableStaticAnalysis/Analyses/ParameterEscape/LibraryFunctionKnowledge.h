@@ -88,15 +88,43 @@ public:
   static bool parameterDoesNotEscape(const FunctionDecl *FD,
                                      unsigned ParamIndex, ASTContext &Ctx);
 
-  /// True iff FD is a recognized C library deallocation or reallocation
-  /// function. Passing an alias to one is an escape, never a benign use.
+  /// True iff FD's *spelling* names a C library deallocation or reallocation
+  /// function of the matching arity. Passing an alias to one is an escape,
+  /// never a benign use.
   ///
-  /// `false` must NOT be read as "safe to treat as benign". It only means this
-  /// table did not recognize FD as a deallocator -- which it will not, for
-  /// instance, under `-fno-builtin` or `-fno-builtin-free`, where `free` itself
-  /// answers `false`. That is sound only because an unrecognized callee is a
-  /// sink by default; this predicate exists to *add* refusals, never to license
-  /// a use.
+  /// This predicate has the opposite polarity to the one above, and is
+  /// deliberately ungated because of it. `parameterDoesNotEscape` answers a
+  /// question about *trust*: everything that makes clang unsure this
+  /// declaration is the library function -- `-fno-builtin`,
+  /// `-fno-builtin-<name>`, `-ffreestanding`, a target with no C runtime, a
+  /// spelling without C language linkage, a renaming `asm` label, a definition
+  /// in this very TU -- must turn the answer off, because each of them is a
+  /// reason the real callee may not behave as the table says. Here the same
+  /// doubt must turn the answer *on*: a body that frees its argument looks
+  /// entirely benign to an escape analysis (it only writes through the
+  /// pointer), so the name is the only evidence there is, and losing it loses
+  /// the sink rather than losing precision.
+  ///
+  /// Consequences, both deliberate:
+  ///  - `-ffreestanding` or `-fno-builtin` no longer switch the refusal off.
+  ///    Before, they did: `free` stopped being a builtin, became an ordinary
+  ///    nameable entity, and the call came out as a clean flow edge into a
+  ///    function whose own body -- a pool allocator writing a header through
+  ///    the pointer -- reports no escape. The caller's parameter was then
+  ///    annotated `noescape` while the callee deallocated through it.
+  ///  - Any function whose spelling and arity match a row is refused, including
+  ///    a C++ member or namespaced `free(void *)` that has nothing to do with
+  ///    the C library. That costs precision on those calls -- on the argument
+  ///    and on the receiver alike, since `pool.free(p)` refuses the implicit
+  ///    object too -- and the same argument applies to them anyway, since a
+  ///    custom deallocator is exactly as invisible to this analysis as libc's.
+  ///
+  /// `false` still must NOT be read as "safe to treat as benign": it means only
+  /// that no row matched. Callers must already default to escape.
+  ///
+  /// \p Ctx is retained for signature stability and is deliberately unused --
+  /// every language option it could offer is a reason to distrust the table,
+  /// and distrust must not switch a refusal off.
   static bool isDeallocationFunction(const FunctionDecl *FD, ASTContext &Ctx);
 };
 

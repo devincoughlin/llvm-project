@@ -109,12 +109,24 @@ struct suspend_never {
 class ParameterEscapeExtractorTest : public TestFixture {
 protected:
   SSAFOptions Opts;
-  TUSummary TUSum{
-      llvm::Triple("arm64-apple-macosx"),
-      BuildNamespace(BuildNamespaceKind::CompilationUnit, "Mock.cpp")};
-  TUSummaryBuilder Builder{TUSum, Opts};
+  /// Rebuilt by every setUp(). The builder keeps the first summary contributed
+  /// under an EntityId and drops the rest, so a second setUp() in one test
+  /// would read back the first one's facts for every name whose USR it reuses
+  /// -- silently, and for exactly the cases a loop over compiler flags is
+  /// written to distinguish.
+  std::optional<TUSummary> TUSum;
+  std::optional<TUSummaryBuilder> Builder;
   std::unique_ptr<TUSummaryExtractor> Extractor;
   std::unique_ptr<ASTUnit> AST;
+
+  void resetSummaryState() {
+    Extractor.reset();
+    Builder.reset(); // holds a reference to TUSum; destroy it first
+    TUSum.emplace(llvm::Triple("arm64-apple-macosx"),
+                  BuildNamespace(BuildNamespaceKind::CompilationUnit,
+                                 "Mock.cpp"));
+    Builder.emplace(*TUSum, Opts);
+  }
 
   /// A non-empty \p ExpectedError keeps going on an ill-formed TU, and
   /// requires a diagnostic containing that text. The extractor runs as an
@@ -125,6 +137,7 @@ protected:
   bool setUp(StringRef Body, std::vector<std::string> Args = {"-std=c++20"},
              bool WithPrelude = true, tooling::FileContentMappings Files = {},
              StringRef ExpectedError = "") {
+    resetSummaryState();
     std::string Code = WithPrelude ? (Prelude + Body.str()) : Body.str();
     // Diagnostics are only stored when capture is asked for, and a test that
     // names an expected error has to be able to read it back.
@@ -164,7 +177,7 @@ protected:
       ADD_FAILURE() << "ParameterEscape extractor not registered";
       return false;
     }
-    Extractor = makeTUSummaryExtractor(ParameterEscapeSummary::Name, Builder);
+    Extractor = makeTUSummaryExtractor(ParameterEscapeSummary::Name, *Builder);
     Extractor->HandleTranslationUnit(AST->getASTContext());
     return true;
   }
@@ -177,7 +190,7 @@ protected:
       ADD_FAILURE() << "no entity for " << FD->getNameAsString();
       return nullptr;
     }
-    auto &Data = getData(TUSum);
+    auto &Data = getData(*TUSum);
     auto It = Data.find(ParameterEscapeSummary::summaryName());
     if (It == Data.end())
       return nullptr;
@@ -199,6 +212,11 @@ protected:
   // The user-declared constructor of `Class` with `NumParams` parameters.
   const ParameterEscapeSummary *ctorSummaryOf(StringRef Class,
                                               unsigned NumParams) {
+    return summaryOfDecl(ctorOf(Class, NumParams));
+  }
+
+  // The user-declared constructor of \p Class with \p NumParams parameters.
+  const CXXConstructorDecl *ctorOf(StringRef Class, unsigned NumParams) {
     const auto *RD = findDeclByName<CXXRecordDecl>(Class, AST->getASTContext());
     if (!RD) {
       ADD_FAILURE() << "no class " << Class;
@@ -206,7 +224,7 @@ protected:
     }
     for (const CXXConstructorDecl *CD : RD->getDefinition()->ctors())
       if (!CD->isImplicit() && CD->getNumParams() == NumParams)
-        return summaryOfDecl(CD);
+        return CD;
     ADD_FAILURE() << "no ctor " << Class << "/" << NumParams;
     return nullptr;
   }
@@ -217,6 +235,29 @@ protected:
       return nullptr;
     auto It = S->Params.find(Index);
     return It == S->Params.end() ? nullptr : &It->second;
+  }
+
+  const EscapeFact *factOfDecl(const FunctionDecl *FD, unsigned Index) {
+    const ParameterEscapeSummary *S = summaryOfDecl(FD);
+    if (!S)
+      return nullptr;
+    auto It = S->Params.find(Index);
+    return It == S->Params.end() ? nullptr : &It->second;
+  }
+
+  std::optional<EscapeReason> sinkOfDecl(const FunctionDecl *FD,
+                                         unsigned Index) {
+    const EscapeFact *F = factOfDecl(FD, Index);
+    if (!F) {
+      ADD_FAILURE() << "no fact for parameter " << Index;
+      return std::nullopt;
+    }
+    return F->OtherSink ? std::optional(F->OtherSink->Reason) : std::nullopt;
+  }
+
+  const EscapeFact *thisFactOfDecl(const FunctionDecl *FD) {
+    const ParameterEscapeSummary *S = summaryOfDecl(FD);
+    return S && S->This ? &*S->This : nullptr;
   }
 
   const EscapeFact *thisFactOf(StringRef Fn) {
@@ -242,6 +283,21 @@ protected:
       return false;
     std::optional<EntityId> Id = Extractor->addEntity(CD);
     return Id && F->FlowsTo.count(FlowTarget{*Id, CalleeIndex});
+  }
+
+  // Like flowsTo(), but naming the callee by declaration -- constructors and
+  // other functions findFnByName() cannot pick out unambiguously.
+  bool flowsToDecl(const EscapeFact *F, const FunctionDecl *Callee,
+                   int CalleeIndex) {
+    if (!F || !Callee)
+      return false;
+    std::optional<EntityId> Id = Extractor->addEntity(Callee);
+    return Id && F->FlowsTo.count(FlowTarget{*Id, CalleeIndex});
+  }
+
+  // A fact is "clean" when it neither sinks, nor returns, nor flows.
+  static bool isClean(const EscapeFact *F) {
+    return F && !F->OtherSink && !F->returnsSelf() && F->FlowsTo.empty();
   }
 
   // A parameter is "clean" when it neither sinks, nor returns, nor flows.
@@ -275,7 +331,8 @@ TEST_F(ParameterEscapeExtractorTest, PlainDefinitionIsCandidate) {
   const ParameterEscapeSummary *S = summaryOf("f");
   ASSERT_NE(S, nullptr);
   EXPECT_TRUE(S->IsCandidate);
-  EXPECT_EQ(S->CandidateParams, (std::set<unsigned>{0, 2, 3}));
+  // `v` was index 2 while view types were tracked; M1 no longer tracks them.
+  EXPECT_EQ(S->CandidateParams, (std::set<unsigned>{0, 3}));
 }
 
 TEST_F(ParameterEscapeExtractorTest, VirtualIsNotCandidate) {
@@ -342,6 +399,30 @@ TEST_F(ParameterEscapeExtractorTest, MacroRedeclIsNotCandidate) {
 // parameter written in source, so the redeclaration's own location is the only
 // thing that is a macro. This is what pins `Loc.isMacroID()`; the test above
 // passes with that line deleted.
+// The rewritability gate runs over the *candidate* parameters, so narrowing
+// candidacy widens it: a macro-spelled pointer-to-view no longer blocks the
+// definition it sits in, and its neighbours become annotatable where they were
+// not at the merge base. Deliberate -- refusing a definition over a parameter
+// the transformation will never edit would lose every other parameter with it.
+TEST_F(ParameterEscapeExtractorTest, TheRewritabilityGateFollowsCandidacy) {
+  ASSERT_TRUE(setUp("struct [[gsl::Pointer(int)]] V { int *p; };\n"
+                    "#define VPARAM V *vp\n"
+                    "#define IPARAM int *ip\n"
+                    "void with_view(int *q, VPARAM) { }\n"
+                    "void with_pointer(int *q, IPARAM) { }\n",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const ParameterEscapeSummary *V = summaryOf("with_view");
+  ASSERT_NE(V, nullptr);
+  EXPECT_TRUE(V->IsCandidate);
+  EXPECT_EQ(V->CandidateParams, (std::set<unsigned>{0}));
+  // The control isolates the cause: a macro-spelled parameter that *is* a
+  // candidate still refuses the whole definition.
+  const ParameterEscapeSummary *P = summaryOf("with_pointer");
+  ASSERT_NE(P, nullptr);
+  EXPECT_FALSE(P->IsCandidate);
+  EXPECT_EQ(P->CandidateParams, (std::set<unsigned>{0, 1}));
+}
+
 TEST_F(ParameterEscapeExtractorTest, MacroNamedRedeclIsNotCandidate) {
   ASSERT_TRUE(setUp("#define NAME f\nvoid NAME(int *p);\nvoid f(int *p) { }"));
   const ParameterEscapeSummary *S = summaryOf("f");
@@ -435,11 +516,9 @@ TEST_F(ParameterEscapeExtractorTest, MultiVersionSoleDefinitionIsNotCandidate) {
   const ParameterEscapeSummary *S = summaryOf("mv");
   ASSERT_NE(S, nullptr);
   EXPECT_FALSE(S->IsCandidate);
-  // Not the collision path: this is the ordinary stub fact.
-  const EscapeFact *F = factOf("mv", 0);
-  ASSERT_NE(F, nullptr);
-  ASSERT_TRUE(F->OtherSink.has_value());
-  EXPECT_EQ(F->OtherSink->Detail, "classifier stub");
+  // Not the collision path: the body is classified as usual, and an empty body
+  // uses nothing, so the fact is clean rather than degraded.
+  EXPECT_TRUE(clean("mv", 0));
 }
 
 // A weak definition may be replaced at link time by a strong one from another
@@ -656,10 +735,8 @@ TEST_F(ParameterEscapeExtractorTest, CollisionDegradationIsReproducible) {
 // degradation above is not simply applied to everything.
 TEST_F(ParameterEscapeExtractorTest, SingleDefinitionIsNotDegraded) {
   ASSERT_TRUE(setUp("void solo(int *p) { }"));
-  const EscapeFact *F = factOf("solo", 0);
-  ASSERT_NE(F, nullptr);
-  ASSERT_TRUE(F->OtherSink.has_value());
-  EXPECT_EQ(F->OtherSink->Detail, "classifier stub");
+  ASSERT_NE(factOf("solo", 0), nullptr);
+  EXPECT_TRUE(clean("solo", 0));
   EXPECT_TRUE(summaryOf("solo")->IsCandidate);
 }
 
@@ -702,18 +779,24 @@ TEST_F(ParameterEscapeExtractorTest, CandidateTypesExcludeCallablesAndOwners) {
                     "NonTrivialView nv, int *const *pp) { }"));
   const ParameterEscapeSummary *S = summaryOf("f");
   ASSERT_NE(S, nullptr);
-  EXPECT_EQ(S->CandidateParams, (std::set<unsigned>{2, 4}));
+  // `sv` was index 2 while view types were tracked; only the object pointer
+  // is left.
+  EXPECT_EQ(S->CandidateParams, (std::set<unsigned>{4}));
   // None of the excluded types is pointer-carrying either, so none is even
-  // analyzed. (A tracked view and an object pointer are both.)
-  EXPECT_EQ(analyzedParamsOf("f"), (std::set<unsigned>{2, 4}));
+  // analyzed.
+  EXPECT_EQ(analyzedParamsOf("f"), (std::set<unsigned>{4}));
 }
 
-TEST_F(ParameterEscapeExtractorTest, ViewWithNonTrivialCopyIsNotTracked) {
-  ASSERT_TRUE(setUp("void f(CopyCtorView v, View w) { }"));
+// The inverse of what this test asserted while view types were tracked: a
+// view-typed parameter is now neither analyzed nor a candidate, whether its
+// copy constructor is trivial (`View`) or not (`CopyCtorView`). Nothing is
+// claimed about either, which is what makes dropping the tracking reject-only.
+TEST_F(ParameterEscapeExtractorTest, ViewTypedParametersAreNeitherAnalyzedNorCandidates) {
+  ASSERT_TRUE(setUp("void f(CopyCtorView v, View w, int *keep) { }"));
   const ParameterEscapeSummary *S = summaryOf("f");
   ASSERT_NE(S, nullptr);
-  EXPECT_EQ(S->CandidateParams, (std::set<unsigned>{1}));
-  EXPECT_EQ(analyzedParamsOf("f"), (std::set<unsigned>{1}));
+  EXPECT_EQ(S->CandidateParams, (std::set<unsigned>{2}));
+  EXPECT_EQ(analyzedParamsOf("f"), (std::set<unsigned>{2}));
 }
 
 TEST_F(ParameterEscapeExtractorTest, BlockPointerIsAnalyzedButNotCandidate) {
@@ -762,6 +845,160 @@ TEST_F(ParameterEscapeExtractorTest,
   EXPECT_EQ(analyzedParamsOf("f"), (std::set<unsigned>{4}));
 }
 
+//===--- View types are ordinary records ----------------------------------===//
+
+// M1 tracked `[[gsl::Pointer]]` / `swift_attr("~Escapable")` records
+// field-sensitively and no longer does. Every by-value shape below was a
+// reported missed sink under that tracking -- a handle in a base, in a nested
+// aggregate, in a reference member under either spelling, behind `_Atomic`,
+// or reached through `*this`, `this[0]`, a laundered `void *` or a callee
+// taking `V *`. None of them can claim anything now.
+//
+// A reference to a view is refused with it -- `V &`, `const V &` and `V &&`
+// alike -- so that dropping the tracking stays reject-only. Asserted on
+// CandidateParams as well as on the facts, because that is where the
+// difference would be an emitted annotation rather than an internal detail.
+TEST_F(ParameterEscapeExtractorTest, ViewTypedParametersDropOutByValueAndByReference) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct PBase { int *d; };
+    struct [[gsl::Pointer(int)]] Derived : PBase { };
+    struct Inner { int n; int *q; int &r; };
+    struct [[gsl::Pointer(int)]] NestedV { Inner in; };
+    struct [[gsl::Pointer(int)]] RefV { int &r; };
+    struct __attribute__((swift_attr("~Escapable"))) SwiftRefV { int &r; };
+    struct [[gsl::Pointer(int)]] AtomV { _Atomic(int *) a; };
+    struct [[gsl::Pointer(int)]] Flat { int *p; };
+    int *g_int;
+    void base(Derived v, int *keep)     { g_int = v.d; (void)keep; }
+    void nested(NestedV v, int *keep)   { g_int = v.in.q; (void)keep; }
+    void ref(RefV v, int *keep)         { g_int = &v.r; (void)keep; }
+    void swift_ref(SwiftRefV v, int *keep) { g_int = &v.r; (void)keep; }
+    void atom(AtomV v, int *keep)       { g_int = v.a; (void)keep; }
+    void flat(Flat v, int *keep)        { g_int = v.p; (void)keep; }
+    void flat_ref(Flat &v, int *keep)   { g_int = v.p; (void)keep; }
+    void flat_cref(const Flat &v, int *keep) { g_int = v.p; (void)keep; }
+    void flat_rref(Flat &&v, int *keep) { g_int = v.p; (void)keep; }
+    void plain_ref(int &n, int *keep)   { g_int = &n; (void)keep; }
+    void swift_ref_param(SwiftRefV &v, int *keep) { g_int = &v.r; (void)keep; }
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  for (const char *Fn : {"base", "nested", "ref", "swift_ref", "atom", "flat"}) {
+    const ParameterEscapeSummary *S = summaryOf(Fn);
+    ASSERT_NE(S, nullptr) << Fn;
+    EXPECT_EQ(analyzedParamsOf(Fn), (std::set<unsigned>{1})) << Fn;
+    EXPECT_EQ(S->CandidateParams, (std::set<unsigned>{1})) << Fn;
+  }
+  // All three reference spellings are refused with the view: no fact, and no
+  // annotation emitted. Reading a field through one is a load that design
+  // section 1.1 makes fresh, so tracking or not decides what is *claimed*
+  // here, and M1 claims nothing while the byte-versus-pointer question is open.
+  // Both spellings of "view", by reference as well as by value.
+  for (const char *Fn :
+       {"flat_ref", "flat_cref", "flat_rref", "swift_ref_param"}) {
+    const ParameterEscapeSummary *R = summaryOf(Fn);
+    ASSERT_NE(R, nullptr) << Fn;
+    EXPECT_EQ(analyzedParamsOf(Fn), (std::set<unsigned>{1})) << Fn;
+    EXPECT_EQ(R->CandidateParams, (std::set<unsigned>{1})) << Fn;
+  }
+  // A reference to anything else is untouched, so the refusal cannot be read
+  // as "references dropped out".
+  const ParameterEscapeSummary *P = summaryOf("plain_ref");
+  ASSERT_NE(P, nullptr);
+  EXPECT_EQ(analyzedParamsOf("plain_ref"), (std::set<unsigned>{0, 1}));
+  EXPECT_EQ(P->CandidateParams, (std::set<unsigned>{0, 1}));
+}
+
+// A pointer to a view keeps its fact -- refusing it from the analysis
+// population would stop its uses being classified rather than refuse them, and
+// callers read those facts -- but it leaves candidacy, so M1 emits no
+// annotation for a view shape while the byte-versus-pointer question is open.
+TEST_F(ParameterEscapeExtractorTest, PointersToViewsAreAnalyzedButNotCandidates) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct [[gsl::Pointer(int)]] Flat { int *p; };
+    struct __attribute__((swift_attr("~Escapable"))) SwiftFlat { int *p; };
+    struct Plain { int *p; };
+    int *g_int;
+    void gsl_ptr(Flat *v, int *keep)        { g_int = v->p; (void)keep; }
+    void gsl_cptr(const Flat *v, int *keep) { g_int = v->p; (void)keep; }
+    void swift_ptr(SwiftFlat *v, int *keep) { g_int = v->p; (void)keep; }
+    void plain_ptr(Plain *v, int *keep)     { g_int = v->p; (void)keep; }
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  for (const char *Fn : {"gsl_ptr", "gsl_cptr", "swift_ptr"}) {
+    const ParameterEscapeSummary *S = summaryOf(Fn);
+    ASSERT_NE(S, nullptr) << Fn;
+    // Still analyzed, and still answered: reading a field through it is a load
+    // that design section 1.1 makes fresh.
+    EXPECT_EQ(analyzedParamsOf(Fn), (std::set<unsigned>{0, 1})) << Fn;
+    EXPECT_TRUE(clean(Fn, 0)) << Fn;
+    // Not annotated.
+    EXPECT_EQ(S->CandidateParams, (std::set<unsigned>{1})) << Fn;
+  }
+  // A pointer to any other record is untouched, so this cannot be read as
+  // "pointers to records dropped out".
+  const ParameterEscapeSummary *P = summaryOf("plain_ptr");
+  ASSERT_NE(P, nullptr);
+  EXPECT_EQ(analyzedParamsOf("plain_ptr"), (std::set<unsigned>{0, 1}));
+  EXPECT_EQ(P->CandidateParams, (std::set<unsigned>{0, 1}));
+}
+
+// Refusing a type is reject-only only while every use of it still reaches a
+// rule. An argument matched to a callee parameter outside the analyzed
+// population has no node to flow into, and an edge recorded against one cannot
+// be resolved -- the escape the callee records would be lost with it. Measured
+// against the same shape on an ordinary record, which keeps its edge.
+TEST_F(ParameterEscapeExtractorTest, ArgumentsToUnanalyzedParametersSink) {
+  ASSERT_TRUE(setUp("struct [[gsl::Pointer(int)]] V { int *p; };\n"
+                    "struct R { int *p; };\n"
+                    "V *g_pv; R *g_r;\n"
+                    "void keeps_v(V &v) { g_pv = &v; }\n"
+                    "void keeps_r(R &r) { g_r = &r; }\n"
+                    "void via_view(V *pv) { keeps_v(*pv); }\n"
+                    "void via_record(R *pr) { keeps_r(*pr); }\n",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  // The record keeps its edge, and the callee's own fact reports the escape --
+  // `g_r = &r` is an ordinary pointer escape, not a byte question.
+  EXPECT_TRUE(flowsTo("via_record", 0, "keeps_r", 0));
+  EXPECT_EQ(sinkOf("via_record", 0), std::nullopt);
+  EXPECT_EQ(sinkOf("keeps_r", 0), EscapeReason::StoreToGlobal);
+  // The view reference has no node, so the same use sinks instead of flowing.
+  const EscapeFact *F = factOf("via_view", 0);
+  ASSERT_TRUE(F && F->OtherSink);
+  EXPECT_EQ(F->OtherSink->Reason, EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(F->OtherSink->Detail,
+            "callee parameter outside the analyzed population");
+  EXPECT_TRUE(F->FlowsTo.empty());
+}
+
+// The property that makes dropping the tracking safe: an alias that reaches a
+// view object still escapes, by the rules that cover every other record.
+TEST_F(ParameterEscapeExtractorTest, AliasesReachingAViewStillSink) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct [[gsl::Pointer(int)]] Flat { int *h; };
+    struct [[gsl::Pointer(int)]] Made { int *h; Made(int *q); };
+    Made::Made(int *q) : h(q) { }
+    Flat g_flat;
+    void store(int *p)  { Flat f; f.h = p; (void)f; }
+    void global(int *p) { g_flat.h = p; }
+    void init(int *p)   { Flat f = {p}; (void)f; }
+    void ctor(int *p)   { Made m(p); (void)m; }
+    void capture(int *p) { auto l = [q = Flat{p}] { return q.h; }; (void)l; }
+  )cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("store", 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOf("global", 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOf("init", 0), EscapeReason::StoreToField);
+  // Building the view is itself a store into its field, which is reached
+  // before the capture is -- either way the alias does not get away.
+  EXPECT_EQ(sinkOf("capture", 0), EscapeReason::StoreToField);
+  // A constructor is an ordinary flow target, and its own fact reports the
+  // store -- so the escape is still expressed, one node along.
+  const CXXConstructorDecl *CD = ctorOf("Made", 1);
+  ASSERT_NE(CD, nullptr);
+  EXPECT_TRUE(flowsToDecl(factOf("ctor", 0), CD, 0));
+  EXPECT_EQ(sinkOfDecl(CD, 0), EscapeReason::StoreToField);
+}
+
 //===--- `this` -----------------------------------------------------------===//
 
 TEST_F(ParameterEscapeExtractorTest, ThisFactOnlyForInstanceMethods) {
@@ -773,41 +1010,27 @@ TEST_F(ParameterEscapeExtractorTest, ThisFactOnlyForInstanceMethods) {
   EXPECT_EQ(thisFactOf("freefn"), nullptr);
 }
 
-//===--- The stub's facts are sound ---------------------------------------===//
+//===--- A definition that uses nothing -----------------------------------===//
 
-TEST_F(ParameterEscapeExtractorTest, StubSinksEveryAnalyzedParameterAndThis) {
-  // No prelude, so the locations below are absolute: `g` is named on line 4,
-  // column 6. Line and column differ, so a transposition cannot hide.
+// Every analyzed parameter carries a fact whether or not it escapes; an unused
+// one carries the clean fact, not an absent entry. CandidateParams is a subset
+// of the fact keys (asserted in the extractor), so a missing clean fact would
+// trip that assert -- and a candidate's whole summary could be dropped as
+// empty().
+TEST_F(ParameterEscapeExtractorTest, UnusedParametersAndThisAreClean) {
   ASSERT_TRUE(setUp("struct [[gsl::Pointer(int)]] View { int *d; };\n"
-                    "\n"
-                    "\n"
-                    "void g(int *p, View v, int &r, int n) { }",
+                    "struct S { void g(int *p, View v, int &r, int n) { } };",
                     {"-std=c++20"}, /*WithPrelude=*/false));
   const ParameterEscapeSummary *S = summaryOf("g");
   ASSERT_NE(S, nullptr);
   EXPECT_TRUE(S->IsCandidate);
-  EXPECT_EQ(analyzedParamsOf("g"), (std::set<unsigned>{0, 1, 2}));
-  for (unsigned I : {0u, 1u, 2u}) {
-    const EscapeFact *F = factOf("g", I);
-    ASSERT_NE(F, nullptr) << "index " << I;
-    EXPECT_TRUE(F->FlowsTo.empty()) << "index " << I;
-    EXPECT_FALSE(F->returnsSelf()) << "index " << I;
-    ASSERT_TRUE(F->OtherSink.has_value()) << "index " << I;
-    EXPECT_EQ(F->OtherSink->Reason, EscapeReason::UnrecognizedUse)
-        << "index " << I;
-    EXPECT_EQ(F->OtherSink->Detail, "classifier stub") << "index " << I;
-    EXPECT_EQ(F->OtherSink->Location.FilePath, "input.cc") << "index " << I;
-    EXPECT_EQ(F->OtherSink->Location.Line, 4u) << "index " << I;
-    EXPECT_EQ(F->OtherSink->Location.Column, 6u) << "index " << I;
+  // `v` is a view type, which M1 does not track.
+  EXPECT_EQ(analyzedParamsOf("g"), (std::set<unsigned>{0, 2}));
+  for (unsigned I : {0u, 2u}) {
+    ASSERT_NE(factOf("g", I), nullptr) << "index " << I;
+    EXPECT_TRUE(clean("g", I)) << "index " << I;
   }
-}
-
-TEST_F(ParameterEscapeExtractorTest, StubSinksThisOfAnInstanceMethod) {
-  ASSERT_TRUE(setUp("struct S { void m() { } };"));
-  const EscapeFact *F = thisFactOf("m");
-  ASSERT_NE(F, nullptr);
-  ASSERT_TRUE(F->OtherSink.has_value());
-  EXPECT_EQ(F->OtherSink->Reason, EscapeReason::UnrecognizedUse);
+  EXPECT_TRUE(isClean(thisFactOf("g")));
 }
 
 TEST_F(ParameterEscapeExtractorTest, CoroutineThisIsSunkAsCoroutine) {
@@ -862,15 +1085,15 @@ TEST_F(ParameterEscapeExtractorTest,
   degradeToMultipleDefinitions(S, Host, AST->getASTContext());
 
   EXPECT_FALSE(S.IsCandidate);
-  // Rebuilt from `host`: index 7 is gone, and 0 and 2 are its pointer-carrying
-  // parameters. `n` is neither analyzed nor a candidate.
-  EXPECT_EQ(S.CandidateParams, (std::set<unsigned>{0, 2}));
+  // Rebuilt from `host`: index 7 is gone, and 0 is its only pointer-carrying
+  // parameter. `n` is not analyzed, and neither is the view-typed `v`.
+  EXPECT_EQ(S.CandidateParams, (std::set<unsigned>{0}));
   std::set<unsigned> Keys;
   for (const auto &[Index, Fact] : S.Params)
     Keys.insert(Index);
-  EXPECT_EQ(Keys, (std::set<unsigned>{0, 2}));
+  EXPECT_EQ(Keys, (std::set<unsigned>{0}));
   ASSERT_TRUE(S.This.has_value()) << "host is an instance method";
-  for (const EscapeFact *F : {&S.Params.at(0), &S.Params.at(2), &*S.This}) {
+  for (const EscapeFact *F : {&S.Params.at(0), &*S.This}) {
     EXPECT_TRUE(F->FlowsTo.empty());
     EXPECT_FALSE(F->returnsSelf());
     ASSERT_TRUE(F->OtherSink.has_value());
@@ -924,6 +1147,663 @@ TEST_F(ParameterEscapeExtractorTest, EveryCandidateParameterCarriesAFact) {
         << "candidate parameter " << I << " has no escape fact, so a summary "
         << "holding only it would be dropped as empty()";
   EXPECT_FALSE(S->empty());
+}
+
+//===--- Benign uses ------------------------------------------------------===//
+
+TEST_F(ParameterEscapeExtractorTest, ReadsComparesAndBoolAreBenign) {
+  ASSERT_TRUE(setUp("int f(int *p, int *q, int &r) { int x = *p + p[1] + r; if "
+                    "(p && p == q) x++; return x + (int)sizeof(*p); }"));
+  EXPECT_TRUE(clean("f", 0));
+  EXPECT_TRUE(clean("f", 1));
+  EXPECT_TRUE(clean("f", 2));
+}
+
+TEST_F(ParameterEscapeExtractorTest, WritesThroughAliasAreBenign) {
+  ASSERT_TRUE(setUp("struct S { int m; int *n; }; void f(S *s, int *p, int &r) "
+                    "{ *p = 1; p[2] = 3; s->m = 4; r = 5; s->n = g_ptr; }"));
+  EXPECT_TRUE(clean("f", 0));
+  EXPECT_TRUE(clean("f", 1));
+  EXPECT_TRUE(clean("f", 2));
+}
+
+// The central precision rule, and the one that makes the whole analysis
+// tractable: the value loaded out of the pointee is a different object's
+// address, not the parameter's own. Storing it anywhere says nothing about
+// whether the parameter outlives the call (design section 1.1).
+TEST_F(ParameterEscapeExtractorTest, LoadsThroughNonViewAliasAreFresh) {
+  ASSERT_TRUE(setUp("struct N { N *next; int *v; };\n"
+                    "void f(N *n) { g_ptr = n->v; N *m = n->next; g_ptr = m->v; }\n"
+                    "void h(N *n) { N c = *n; g_ptr = c.v; }"));
+  EXPECT_TRUE(clean("f", 0));
+  // Copying the pointee by value through a trivial implicit copy constructor
+  // is a load of its bytes, not a use of the pointer that designates it.
+  EXPECT_TRUE(clean("h", 0));
+}
+
+// `r` receives the alias from `q` before `q` receives it from `p`, so one pass
+// over the body leaves `r` out of the alias set and the store below unseen.
+TEST_F(ParameterEscapeExtractorTest, AliasGrowthReachesAFixpoint) {
+  ASSERT_TRUE(setUp("void f(int *p) { int *q = nullptr; int *r = nullptr; r = "
+                    "q; q = p; g_ptr = r; }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToGlobal);
+}
+
+TEST_F(ParameterEscapeExtractorTest, DeclaredNoescapeCalleeIsBenign) {
+  ASSERT_TRUE(setUp("void f(int *p) { noesc(p); }"));
+  EXPECT_TRUE(clean("f", 0));
+}
+
+TEST_F(ParameterEscapeExtractorTest, LibraryKnowledgeIsBenign) {
+  ASSERT_TRUE(setUp("size_t f(const char *s, char *d) { memcpy(d, s, 1); "
+                    "return strlen(s); }"));
+  EXPECT_TRUE(clean("f", 0));
+  // memcpy's destination is only 'returned' in LLVM's model, never
+  // `captures(none)`, so the table does not make it benign. It does not become
+  // an ordinary flow either: getEntityName() refuses every FunctionDecl that
+  // carries a builtin id, so no library function can be named as a flow
+  // target, and an unnameable callee has to sink rather than lose the use.
+  EXPECT_EQ(sinkOf("f", 1), EscapeReason::UnnamedCallee);
+}
+
+// The table is only a fact where clang would actually treat the callee as the
+// library function. `no_builtin` is written on the *caller*, so the callee-only
+// signature of LibraryFunctionKnowledge cannot see it; honoring it is this call
+// site's documented obligation.
+TEST_F(ParameterEscapeExtractorTest, NoBuiltinRefusesLibraryKnowledge) {
+  ASSERT_TRUE(setUp(
+      "size_t plain(const char *s) { return strlen(s); }\n"
+      "__attribute__((no_builtin(\"strlen\"))) size_t named(const char *s) { "
+      "return strlen(s); }\n"
+      "__attribute__((no_builtin)) size_t all(const char *s) { return "
+      "strlen(s); }"));
+  EXPECT_TRUE(clean("plain", 0));
+  // Not benign any more, and not a flow either: a builtin cannot be named
+  // (see LibraryKnowledgeIsBenign), so refusing the table's answer leaves an
+  // unnameable callee, which sinks.
+  EXPECT_EQ(sinkOf("named", 0), EscapeReason::UnnamedCallee);
+  EXPECT_EQ(sinkOf("all", 0), EscapeReason::UnnamedCallee);
+}
+
+// Assigning an alias into a local automatic pointer is benign: the variable
+// joins the alias set and its own uses are classified instead.
+TEST_F(ParameterEscapeExtractorTest, StoringIntoALocalVariableIsBenign) {
+  ASSERT_TRUE(setUp("void f(int *p) { int *q = nullptr; q = p; (void)q; }"));
+  EXPECT_TRUE(clean("f", 0));
+}
+
+TEST_F(ParameterEscapeExtractorTest, LocalScalarCopiesJoinAliasSet) {
+  ASSERT_TRUE(setUp("void f(int *p) { int *q = p; int *r; r = q + 1; int &x = "
+                    "*r; g_ptr = &x; }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToGlobal);
+}
+
+TEST_F(ParameterEscapeExtractorTest, DiscardedValuesAreBenign) {
+  ASSERT_TRUE(setUp("void f(int *p) { p; (void)p; for (int *q = p; q; ++q) {} }"));
+  EXPECT_TRUE(clean("f", 0));
+}
+
+TEST_F(ParameterEscapeExtractorTest, DiscardedOperandsAndDifferencesAreBenign) {
+  ASSERT_TRUE(setUp("long f(int *p, int *q) { int x = (p, 0); bool n = "
+                    "noexcept(*p); return (p - q) + x + n + (long)sizeof(*p); }"));
+  EXPECT_TRUE(clean("f", 0));
+  EXPECT_TRUE(clean("f", 1));
+}
+
+// C has no CK_PointerToBoolean cast in a boolean context, so the alias is the
+// direct operand of `!`, `&&`, `||` and `?:` there. Without rows for those,
+// `if (!p) return;` sinks -- and almost no C function could be annotated.
+TEST_F(ParameterEscapeExtractorTest, BooleanContextsAreBenignInC) {
+  ASSERT_TRUE(setUp("void nots(int *p) { if (!p) return; }\n"
+                    "void ands(int *p, int *q) { if (p && q) return; }\n"
+                    "void ors(int *p) { if (p || 1) return; }\n"
+                    "void cond(int *p) { int x = p ? 1 : 2; (void)x; }\n",
+                    {"-x", "c", "-std=c17"}, /*WithPrelude=*/false));
+  EXPECT_TRUE(clean("nots", 0));
+  EXPECT_TRUE(clean("ands", 0));
+  EXPECT_TRUE(clean("ands", 1));
+  EXPECT_TRUE(clean("ors", 0));
+  EXPECT_TRUE(clean("cond", 0));
+}
+
+// A braced initializer for a scalar carries the value through: `int *q = {p}`
+// is `int *q = p`, and the variable joins the alias set instead of the
+// initializer list reading as a store into an aggregate's field.
+TEST_F(ParameterEscapeExtractorTest, BracedScalarInitializersPropagate) {
+  ASSERT_TRUE(setUp("struct A { int *m; };\n"
+                    "void take(int *);\n"
+                    "void f(int *p) { int *q = {p}; (void)q; }\n"
+                    "void g(int *p) { int *q = {p}; g_ptr = q; }\n"
+                    "void h(int *p) { A a = {p}; (void)a; }\n"
+                    "void i(int *p) { A a = { {p} }; (void)a; }\n"
+                    "void j(int *p) { take({p}); }\n"
+                    "int *k(int *p) { return {p}; }\n"
+                    "void l(int *p) { static int *q = {p}; (void)q; }"));
+  EXPECT_TRUE(clean("f", 0));
+  EXPECT_EQ(sinkOf("g", 0), EscapeReason::StoreToGlobal);
+  // An aggregate's initializer list still stores into its fields, whether the
+  // element is braced or not.
+  EXPECT_EQ(sinkOf("h", 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOf("i", 0), EscapeReason::StoreToField);
+  // Transparent everywhere else the list can appear, too.
+  EXPECT_TRUE(flowsTo("j", 0, "take", 0));
+  EXPECT_EQ(sinkOf("j", 0), std::nullopt);
+  EXPECT_TRUE(factOf("k", 0)->returnsSelf());
+  EXPECT_EQ(sinkOf("l", 0), EscapeReason::StoreToGlobal);
+}
+
+// clang models std::move and std::forward as builtins, which the entity model
+// refuses to name, so recording a flow would degrade to UnnamedCallee and no
+// parameter that is ever moved could be annotated. They re-type their operand
+// and nothing else, so the result is the alias and the argument's use is not an
+// escape of its own.
+TEST_F(ParameterEscapeExtractorTest, StdReferenceCastsPassThrough) {
+  ASSERT_TRUE(setUp(
+      "namespace std {\n"
+      "template <class T> struct remove_reference { typedef T type; };\n"
+      "template <class T> struct remove_reference<T &> { typedef T type; };\n"
+      "template <class T> typename remove_reference<T>::type &&move(T &&t) "
+      "noexcept;\n"
+      "}\n"
+      "void discard(int *p) { (void)std::move(p); }\n"
+      "void store(int *p) { g_ptr = std::move(p); }\n"
+      "void pass(int *p) { unknown(std::move(p)); }"));
+  EXPECT_TRUE(clean("discard", 0));
+  EXPECT_EQ(sinkOf("store", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(flowsTo("pass", 0, "unknown", 0));
+  EXPECT_EQ(sinkOf("pass", 0), std::nullopt);
+}
+
+// The row above is a third trusted external source, and clang hands out those
+// builtin ids on a shape test -- namespace, name, one parameter -- without ever
+// looking at a body. The library table refuses a callee it can see a definition
+// for ("definitions are analyzed, never trusted by name"); match that, except
+// for the standard library's own definitions, which live in system headers and
+// are the whole point of the row.
+TEST_F(ParameterEscapeExtractorTest, StdReferenceCastsWithABodyAreNotTrusted) {
+  ASSERT_TRUE(setUp(
+      "namespace std {\n"
+      "template <class T> struct remove_reference { typedef T type; };\n"
+      "template <class T> struct remove_reference<T &> { typedef T type; };\n"
+      "template <class T> typename remove_reference<T>::type &&move(T &&t) "
+      "noexcept { g_ptr = (int *)t; return static_cast<typename "
+      "remove_reference<T>::type &&>(t); }\n"
+      "}\n"
+      "void pass(int *p) { unknown(std::move(p)); }"));
+  EXPECT_EQ(sinkOf("pass", 0), EscapeReason::UnnamedCallee);
+}
+
+// A labelled or attributed statement wraps a statement without changing what
+// happens to its value; outside a statement expression that value is discarded.
+TEST_F(ParameterEscapeExtractorTest, LabelledAndAttributedStatementsDiscard) {
+  ASSERT_TRUE(setUp("void f(int *p, int c) { lbl: p; if (c) [[likely]] p; "
+                    "(void)c; }"));
+  EXPECT_TRUE(clean("f", 0));
+}
+
+//===--- Flows ------------------------------------------------------------===//
+
+TEST_F(ParameterEscapeExtractorTest, ArgumentsFlowToCalleeParameters) {
+  ASSERT_TRUE(setUp("void callee(int *a, int *b); void f(int *p, int &r) { "
+                    "callee(p, &r); }"));
+  EXPECT_TRUE(flowsTo("f", 0, "callee", 0));
+  EXPECT_TRUE(flowsTo("f", 1, "callee", 1));
+  EXPECT_EQ(sinkOf("f", 0), std::nullopt);
+}
+
+TEST_F(ParameterEscapeExtractorTest, ImplicitObjectFlowsToThis) {
+  ASSERT_TRUE(setUp("void f(Owner *o, int *p) { o->push(p); }"));
+  EXPECT_TRUE(flowsTo("f", 0, "push", ThisParamIndex));
+  EXPECT_TRUE(flowsTo("f", 1, "push", 0));
+}
+
+TEST_F(ParameterEscapeExtractorTest,
+       CallResultsAliasArgumentsAndArgumentsStillFlow) {
+  ASSERT_TRUE(setUp("int *id(int *x); void f(int *p) { int *q = id(p); g_ptr = "
+                    "q; } void g(int *p) { (void)id(p); }"));
+  EXPECT_TRUE(flowsTo("f", 0, "id", 0));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(flowsTo("g", 0, "id", 0));
+  EXPECT_EQ(sinkOf("g", 0), std::nullopt);
+}
+
+TEST_F(ParameterEscapeExtractorTest, NonPointerCallResultsAreFresh) {
+  ASSERT_TRUE(setUp("int len(int *x); void f(int *p) { int n = len(p); (void)n; }"));
+  EXPECT_TRUE(flowsTo("f", 0, "len", 0));
+  EXPECT_EQ(sinkOf("f", 0), std::nullopt);
+}
+
+// One edge per target, carrying the *first* call site.
+TEST_F(ParameterEscapeExtractorTest, FlowRecordsTheFirstCallSite) {
+  // No prelude, so the location is absolute: the first argument is on line 3
+  // at column 10. Line and column differ, so a transposition cannot hide.
+  ASSERT_TRUE(setUp("void callee(int *a);\n"
+                    "void f(int *p) {\n"
+                    "  callee(p);\n"
+                    "      callee(p);\n"
+                    "}\n",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const EscapeFact *F = factOf("f", 0);
+  ASSERT_TRUE(F && F->FlowsTo.size() == 1);
+  const SourceLocationRecord &L = F->FlowsTo.begin()->second;
+  EXPECT_EQ(L.FilePath, "input.cc");
+  EXPECT_EQ(L.Line, 3u);
+  EXPECT_EQ(L.Column, 10u);
+}
+
+//===--- Return -----------------------------------------------------------===//
+
+TEST_F(ParameterEscapeExtractorTest, ReturnIsRecorded) {
+  ASSERT_TRUE(setUp("int *f(int *p) { return p; } int &g(int *p) { return *p; "
+                    "} int h(int *p) { return *p; }"));
+  EXPECT_TRUE(factOf("f", 0)->returnsSelf());
+  EXPECT_TRUE(factOf("g", 0)->returnsSelf());
+  EXPECT_FALSE(factOf("h", 0)->returnsSelf());
+}
+
+//===--- Sinks ------------------------------------------------------------===//
+
+TEST_F(ParameterEscapeExtractorTest, StoreSinks) {
+  ASSERT_TRUE(setUp(R"cpp(
+    struct S { int *m; };
+    void to_global(int *p) { g_ptr = p; }
+    void to_static(int *p) { s_ptr = p; }
+    void to_static_local(int *p) { static int *l; l = p; }
+    void to_static_local_init(int *p) { static int *l = p; (void)l; }
+    void to_thread_local(int *p) { static thread_local int *t; t = p; }
+    void to_field(S *s, int *p) { s->m = p; }
+    void to_local_aggregate(int *p) { S s; s.m = p; }
+    void to_init_list(int *p) { S s{p}; (void)s; }
+    void through_pointer(int **pp, int *p) { *pp = p; }
+    void through_subscript(int **arr, int *p) { arr[0] = p; }
+    void through_ref_param(int *&out, int *p) { out = p; }
+    void through_local_ref(int *p) { int *&r = g_ptr; r = p; }
+    void self_store(void **pp) { *pp = pp; }
+  )cpp"));
+  EXPECT_EQ(sinkOf("to_global", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("to_static", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("to_static_local", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("to_static_local_init", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("to_thread_local", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("to_field", 1), EscapeReason::StoreToField);
+  EXPECT_TRUE(clean("to_field", 0));
+  EXPECT_EQ(sinkOf("to_local_aggregate", 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOf("to_init_list", 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOf("through_pointer", 1), EscapeReason::StoreThroughPointer);
+  EXPECT_TRUE(clean("through_pointer", 0));
+  EXPECT_EQ(sinkOf("through_subscript", 1), EscapeReason::StoreThroughPointer);
+  EXPECT_EQ(sinkOf("through_ref_param", 1), EscapeReason::StoreThroughPointer);
+  // Storing *into* the referent of a reference parameter does not leak the
+  // reference itself.
+  EXPECT_TRUE(clean("through_ref_param", 0));
+  EXPECT_EQ(sinkOf("through_local_ref", 0), EscapeReason::StoreThroughPointer);
+  EXPECT_EQ(sinkOf("self_store", 0), EscapeReason::StoreThroughPointer);
+}
+
+TEST_F(ParameterEscapeExtractorTest, AggregateInitializersStoreToFields) {
+  ASSERT_TRUE(setUp("struct A { int *m; };\n"
+                    "void braced(int *p) { A a{p}; (void)a; }\n"
+                    "void parens(int *p) { A a(p); (void)a; }"));
+  EXPECT_EQ(sinkOf("braced", 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOf("parens", 0), EscapeReason::StoreToField);
+}
+
+TEST_F(ParameterEscapeExtractorTest, DesignatedInitializersStoreToFields) {
+  ASSERT_TRUE(setUp("struct A { int *m; };\n"
+                    "void f(int *p) { struct A a = { .m = p }; (void)a; }",
+                    {"-x", "c", "-std=c17"}, /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToField);
+}
+
+TEST_F(ParameterEscapeExtractorTest, AddressAndReferenceToTheVariable) {
+  ASSERT_TRUE(setUp("void take(int **); void f(int *p) { take(&p); } void "
+                    "g(int *p) { int *&r = p; (void)r; }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::AddressTaken);
+  EXPECT_EQ(sinkOf("g", 0), EscapeReason::AddressTaken);
+}
+
+TEST_F(ParameterEscapeExtractorTest, ArrayMemberDecayIsAnInteriorPointer) {
+  ASSERT_TRUE(setUp("struct A { int a[4]; };\n"
+                    "void f(A *s) { g_ptr = s->a; }\n"
+                    "void w(A *s) { *(s->a) = 1; }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToGlobal);
+  // The decayed array is a pointer *value*, so dereferencing it lands back on
+  // the pointee and writing through it stays benign.
+  EXPECT_TRUE(clean("w", 0));
+}
+
+TEST_F(ParameterEscapeExtractorTest, StatementExpressionPropagates) {
+  ASSERT_TRUE(setUp("void f(int *p) { g_ptr = ({ p; }); }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToGlobal);
+}
+
+// clang gives a statement expression the value of its last statement even when
+// a label or an attribute wraps it. Without unwrapping, the wrapper has no
+// alias kind and the wrapped expression reads as a discarded value, so the
+// store below is classified by nobody.
+TEST_F(ParameterEscapeExtractorTest, StatementExpressionPropagatesThroughALabel) {
+  ASSERT_TRUE(setUp("void f(int *p) { g_ptr = ({ lbl: p; }); }\n"
+                    "void g(int *p) { g_ptr = ({ int *q = p; q; }); }\n"
+                    "void h(int *p) { g_ptr = ({ if (1) ; p; }); }\n"
+                    "void o(int *p, int *q) { g_ptr = ({ lbl: q; }); (void)p; }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("g", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("h", 0), EscapeReason::StoreToGlobal);
+  // The value has to be *resolved*, not merely assumed: only `q` is stored, so
+  // `p` stays clean. Falling back to "some pointer-carrying value" would sink
+  // both.
+  EXPECT_TRUE(clean("o", 0));
+  EXPECT_EQ(sinkOf("o", 1), EscapeReason::StoreToGlobal);
+}
+
+// Both halves of the increment rule, which the alias kind of the *operand*
+// decides: incrementing storage that holds an alias yields the alias, while
+// incrementing through a place reads the pointee.
+TEST_F(ParameterEscapeExtractorTest, IncrementsYieldAnAliasOnlyFromStorage) {
+  ASSERT_TRUE(setUp(
+      "void f(int *p, int **pp) { (*p)++; ++p[1]; (*pp)++; }\n"
+      "void g(int **pp) { g_ptr = (*pp)++; }\n"
+      "void h(int *p, int *q, int *r, int *s) { g_ptr = p++; g_ptr = ++q; "
+      "g_ptr = r--; g_ptr = --s; }"));
+  // A read-modify-write through a place writes the pointee and yields a value
+  // loaded from it; neither is the pointer that designates it.
+  EXPECT_TRUE(clean("f", 0));
+  EXPECT_TRUE(clean("f", 1));
+  // `(*pp)++` yields the old *pointee*, which design section 1.1 makes fresh.
+  EXPECT_TRUE(clean("g", 0));
+  // `p++` yields the parameter's own pointer, which is an alias -- one opcode
+  // per parameter, because the rule takes four of them and the classifier's
+  // paired row calls an increment benign whenever the operand reaches it.
+  for (unsigned I : {0u, 1u, 2u, 3u})
+    EXPECT_EQ(sinkOf("h", I), EscapeReason::StoreToGlobal) << "index " << I;
+}
+
+// `__extension__ e` is a UnaryOperator wrapping e. Without propagating through
+// it the wrapped expression has no alias kind, the alias reaches no use rule of
+// its own, and the store below goes unseen.
+TEST_F(ParameterEscapeExtractorTest, ExtensionExpressionsPropagate) {
+  ASSERT_TRUE(setUp("void f(int *p) { g_ptr = __extension__ p; }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToGlobal);
+}
+
+TEST_F(ParameterEscapeExtractorTest, StructuredBindingsResolveThroughTheirBinding) {
+  ASSERT_TRUE(setUp("struct P { int x, y; }; void f(P *ps) { auto &[a, b] = "
+                    "*ps; g_ptr = &a; } void g(P *ps) { auto &[a, b] = *ps; "
+                    "int s = a + b; (void)s; }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(clean("g", 0));
+}
+
+TEST_F(ParameterEscapeExtractorTest, CleanupVariablesAreNotAliasStorage) {
+  ASSERT_TRUE(setUp("void keep(int **);\n"
+                    "void f(int *p) { int *q __attribute__((cleanup(keep))) = "
+                    "p; (void)q; }\n"
+                    "void g(int *p) { int *q __attribute__((cleanup(keep))) = "
+                    "g_ptr; q = p; (void)q; }"));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::AddressTaken);
+  EXPECT_EQ(sinkOf("g", 0), EscapeReason::AddressTaken);
+}
+
+// The refusal side of the library table has the opposite polarity to the trust
+// side: a configuration that makes clang unsure this declaration is the library
+// function must not switch the refusal off. A pool allocator compiled
+// -ffreestanding writes a header through the pointer and so reports no escape
+// of its own, which is exactly the body that would let a caller be annotated.
+TEST_F(ParameterEscapeExtractorTest, DeallocatorsAreRefusedWithoutBuiltins) {
+  constexpr const char *Code =
+      "typedef __SIZE_TYPE__ size_t;\n"
+      "void free(void *p);\n"
+      "void *realloc(void *p, size_t n);\n"
+      "void rel(int *p) { free(p); }\n"
+      "void rea(int *p) { realloc(p, 8); }\n";
+  for (std::vector<std::string> Args :
+       {std::vector<std::string>{"-x", "c", "-std=c17"},
+        {"-x", "c", "-std=c17", "-ffreestanding"},
+        {"-x", "c", "-std=c17", "-fno-builtin"},
+        {"-x", "c", "-std=c17", "-fno-builtin-free"}}) {
+    SCOPED_TRACE(Args.back());
+    ASSERT_TRUE(setUp(Code, Args, /*WithPrelude=*/false));
+    EXPECT_EQ(sinkOf("rel", 0), EscapeReason::Deallocation);
+    EXPECT_EQ(sinkOf("rea", 0), EscapeReason::Deallocation);
+  }
+  // In C++ a plain `void free(void *)` is not even the C library function by
+  // name mangling, and it is refused all the same: whatever it is, this
+  // analysis cannot tell a body that frees from one that only writes.
+  ASSERT_TRUE(setUp("void free(void *p);\nvoid rel(int *p) { free(p); }\n",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("rel", 0), EscapeReason::Deallocation);
+}
+
+TEST_F(ParameterEscapeExtractorTest, CallSinks) {
+  ASSERT_TRUE(setUp(R"cpp(
+    void v(int, ...);
+    void indirect(void (*fp)(int *), int *p) { fp(p); }
+    void variadic(int *p) { v(1, p); }
+    void dealloc(void *p) { free(p); }
+    void del(int *p) { delete p; }
+    void op_del(int *p) { ::operator delete(p); }
+    void heap(int *p) { new Holder(p); }
+    void heap_scalar(int *p) { int **q = new int *(p); (void)q; }
+    struct B { virtual void m(int *); };
+    void virt(B *b, int *p) { b->m(p); }
+  )cpp"));
+  EXPECT_EQ(sinkOf("indirect", 1), EscapeReason::IndirectCall);
+  EXPECT_EQ(sinkOf("variadic", 0), EscapeReason::VarArgs);
+  EXPECT_EQ(sinkOf("dealloc", 0), EscapeReason::Deallocation);
+  EXPECT_EQ(sinkOf("del", 0), EscapeReason::Deallocation);
+  EXPECT_EQ(sinkOf("op_del", 0), EscapeReason::Deallocation);
+  EXPECT_EQ(sinkOf("heap", 0), EscapeReason::HeapAllocation);
+  EXPECT_EQ(sinkOf("heap_scalar", 0), EscapeReason::HeapAllocation);
+  EXPECT_EQ(sinkOf("virt", 0), EscapeReason::VirtualCall);
+  EXPECT_EQ(sinkOf("virt", 1), EscapeReason::VirtualCall);
+}
+
+TEST_F(ParameterEscapeExtractorTest, ConversionThrowAsmAndCaptureSinks) {
+  ASSERT_TRUE(setUp(R"cpp(
+    void cast(int *p) { __UINTPTR_TYPE__ u = (__UINTPTR_TYPE__)p; (void)u; }
+    void thr(int *p) { throw p; }
+    void asm_(int *p) { __asm__("" : : "r"(p)); }
+    void lam(int *p) { auto l = [p] { return *p; }; (void)l; }
+    void lam_ref(int *p) { auto l = [&] { return *p; }; (void)l; }
+    void lam_init(int *p) { auto l = [q = p] { return *q; }; (void)l; }
+  )cpp"));
+  EXPECT_EQ(sinkOf("cast", 0), EscapeReason::CastToNonPointer);
+  EXPECT_EQ(sinkOf("thr", 0), EscapeReason::Throw);
+  EXPECT_EQ(sinkOf("asm_", 0), EscapeReason::Asm);
+  EXPECT_EQ(sinkOf("lam", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("lam_ref", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("lam_init", 0), EscapeReason::Capture);
+}
+
+// An init-capture's initializer runs in the enclosing function, so an alias
+// nested inside one is an ordinary use. Checking only the initializer's own
+// alias kind sees nothing when the capture's type is not pointer-carrying.
+TEST_F(ParameterEscapeExtractorTest, InitCaptureInitializersAreOrdinaryCode) {
+  ASSERT_TRUE(setUp(R"cpp(
+    int record(int *x);
+    struct Rec { int *m; };
+    void call(int *p) { auto l = [n = record(p)] { return n; }; (void)l; }
+    void store(int *p) { auto l = [n = (g_ptr = p, 0)] { return n; }; (void)l; }
+    void field(int *p) { auto l = [r = Rec{p}] { return r.m; }; (void)l; }
+    void convert(int *p) { auto l = [n = (long)p] { return n; }; (void)l; }
+    void grow(int *p) { int *q = nullptr; auto l = [n = (q = p, 0)] { return n; }; g_ptr = q; (void)l; }
+  )cpp"));
+  EXPECT_TRUE(flowsTo("call", 0, "record", 0));
+  EXPECT_EQ(sinkOf("store", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("field", 0), EscapeReason::StoreToField);
+  EXPECT_EQ(sinkOf("convert", 0), EscapeReason::CastToNonPointer);
+  // The growth pass has to walk the initializer too, or `q` never joins the
+  // alias set and the store after the lambda is invisible.
+  EXPECT_EQ(sinkOf("grow", 0), EscapeReason::StoreToGlobal);
+}
+
+TEST_F(ParameterEscapeExtractorTest, BlockCapturesAndCallableUsesSink) {
+  ASSERT_TRUE(setUp("void f(int *p) { void (^b)(void) = ^{ (void)*p; }; (void)b; }\n"
+                    "void g(int *p) { __block int *q = p; (void)q; }\n"
+                    "void g2(int *p) { __block int *q = g_ptr; q = p; (void)q; }\n"
+                    "void h(void (^b)(void)) { b(); }\n"
+                    "struct S { int *f;\n"
+                    "  void m() { void (^b)(void) = ^{ (void)f; }; (void)b; } };",
+                    {"-std=c++20", "-fblocks"}));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("g", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("g2", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("h", 0), EscapeReason::CallableUse);
+  const EscapeFact *M = thisFactOf("m");
+  ASSERT_TRUE(M && M->OtherSink);
+  EXPECT_EQ(M->OtherSink->Reason, EscapeReason::Capture);
+}
+
+TEST_F(ParameterEscapeExtractorTest, UnrecognizedUseIsTheDefault) {
+  // An atomic builtin operating on the alias value is deliberately unmodeled.
+  ASSERT_TRUE(setUp("void f(int *p) { __atomic_store_n(&g_ptr, p, "
+                    "__ATOMIC_SEQ_CST); }"));
+  const EscapeFact *F = factOf("f", 0);
+  ASSERT_TRUE(F && F->OtherSink);
+  EXPECT_EQ(F->OtherSink->Reason, EscapeReason::UnrecognizedUse);
+  // The detail is what distinguishes "the default row fired on this shape"
+  // from "the classifier produced nothing".
+  EXPECT_EQ(F->OtherSink->Detail, "AtomicExpr");
+}
+
+// Statement parents are an allow list: an expression statement, a condition and
+// a loop clause discard or read the value, and anything else -- here ObjC fast
+// enumeration, which hands the collection to the runtime -- reaches the default
+// sink rather than being taken for a discarded value.
+TEST_F(ParameterEscapeExtractorTest, ObjCUsesAreSinks) {
+  ASSERT_TRUE(setUp("@interface Foo\n- (void)take:(int *)p;\n@end\n"
+                    "void msg(Foo *o, int *p) { [o take:p]; }\n"
+                    "void iterate(Foo *c) { for (Foo *x in c) { (void)x; } }\n",
+                    {"-x", "objective-c++", "-std=c++20"},
+                    /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("msg", 0), EscapeReason::ObjCMessage);
+  EXPECT_EQ(sinkOf("msg", 1), EscapeReason::ObjCMessage);
+  EXPECT_EQ(sinkOf("iterate", 0), EscapeReason::UnrecognizedUse);
+}
+
+// An instance variable reached through the parameter is a subobject of the
+// object it designates: reading one is a load, writing one writes into the
+// pointee, and neither is a use of the pointer itself.
+TEST_F(ParameterEscapeExtractorTest, ObjCInstanceVariablesAreSubobjects) {
+  ASSERT_TRUE(setUp("int *g_ptr;\n"
+                    "@interface T { @public int *ivar; }\n@end\n"
+                    "void read(T *t) { g_ptr = t->ivar; }\n"
+                    "void write(T *t) { t->ivar = g_ptr; }\n",
+                    {"-x", "objective-c++", "-std=c++20"},
+                    /*WithPrelude=*/false));
+  EXPECT_TRUE(clean("read", 0));
+  EXPECT_TRUE(clean("write", 0));
+}
+
+// Only the first non-return sink is kept, and it is the first in source order.
+TEST_F(ParameterEscapeExtractorTest, FirstSinkOnlyIsRecordedWithLocation) {
+  // No prelude, so the location is absolute: the alias is used on line 3 at
+  // column 13. Line and column differ, so a transposition cannot hide.
+  ASSERT_TRUE(setUp("int *g_ptr;\n"
+                    "void f(int *p) {\n"
+                    "    g_ptr = p;\n"
+                    "  throw p;\n"
+                    "}\n",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const EscapeFact *F = factOf("f", 0);
+  ASSERT_TRUE(F && F->OtherSink);
+  EXPECT_EQ(F->OtherSink->Reason, EscapeReason::StoreToGlobal);
+  EXPECT_EQ(F->OtherSink->Detail, "g_ptr");
+  EXPECT_EQ(F->OtherSink->Location.FilePath, "input.cc");
+  EXPECT_EQ(F->OtherSink->Location.Line, 3u);
+  EXPECT_EQ(F->OtherSink->Location.Column, 13u);
+}
+
+// An argument with no callee parameter is a variadic tail only when the callee
+// is a prototyped variadic function; an unprototyped callee's arguments are
+// unmatched for an unrelated reason and must not be blamed on varargs.
+TEST_F(ParameterEscapeExtractorTest, UnmatchedArgumentsDistinguishTheVariadicTail) {
+  ASSERT_TRUE(setUp("void v(int, ...);\nvoid f(int *p) { v(1, p); }\n"
+                    "void u();\nvoid g(int *p) { u(p); }\n",
+                    {"-x", "c", "-std=c17"}, /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("f", 0), EscapeReason::VarArgs);
+  EXPECT_EQ(sinkOf("g", 0), EscapeReason::UnmatchedArgument);
+}
+
+//===--- Constructor initializers -----------------------------------------===//
+
+// The parent map does not model CXXCtorInitializer, so a member initializer's
+// expression has the constructor itself as its parent. Without that rule the
+// store below is invisible and the constructor's parameter reads as clean.
+TEST_F(ParameterEscapeExtractorTest, WrittenConstructorInitializersStoreToFields) {
+  ASSERT_TRUE(setUp("struct H { int *p; H(int *q) : p(q) { } H(int *q, int n) "
+                    ": p(q) { } };",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const CXXConstructorDecl *CD = ctorOf("H", 1);
+  ASSERT_NE(CD, nullptr);
+  EXPECT_EQ(sinkOfDecl(CD, 0), EscapeReason::StoreToField);
+  // Writing into the object `this` designates does not leak `this` itself.
+  EXPECT_TRUE(isClean(thisFactOfDecl(CD)));
+}
+
+// A defaulted special member has an empty body and does its work in implicit
+// member initializers, so the traversal has to visit implicit code. Here the
+// initializers only *load* each field out of the source object, which is not a
+// use of the source's own address -- so clean is the right answer, and the
+// tracked-view case below is what proves the initializers are seen at all.
+TEST_F(ParameterEscapeExtractorTest, DefaultedCopyConstructorCopiesFieldsByLoad) {
+  ASSERT_TRUE(setUp("struct S { int *p; S(const S &o) = default; S(int *q, int "
+                    "n) : p(q) { } };\n"
+                    "void use(const S &a) { S b = a; (void)b; }",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  const CXXConstructorDecl *Copy = ctorOf("S", 1);
+  ASSERT_NE(Copy, nullptr);
+  ASSERT_TRUE(Copy->doesThisDeclarationHaveABody())
+      << "the defaulted copy constructor must be defined for this to mean "
+         "anything";
+  EXPECT_TRUE(isClean(factOfDecl(Copy, 0)));
+  EXPECT_TRUE(isClean(thisFactOfDecl(Copy)));
+}
+
+//===--- `this` as a source -----------------------------------------------===//
+
+TEST_F(ParameterEscapeExtractorTest, ThisIsAnAliasSource) {
+  ASSERT_TRUE(setUp("struct S; S *g_s; void helper(S *);\n"
+                    "int *g_ip; char *g_cp;\n"
+                    "struct S { int *f; int n;\n"
+                    "  void store() { g_s = this; }\n"
+                    "  void member_addr() { g_ip = &this->n; }\n"
+                    "  void launder() { g_cp = (char *)this; }\n"
+                    "  void offset() { g_s = this + 0; }\n"
+                    "  S *self() { return this; }\n"
+                    "  void pass() { helper(this); }\n"
+                    "  void call() { other(); }\n"
+                    "  void other();\n"
+                    "  void write(int *p) { this->f = p; }\n"
+                    "  void capture() { auto l = [this] { return f; }; (void)l; } };",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  ASTContext &Ctx = AST->getASTContext();
+  const EscapeFact *Store = thisFactOf("store");
+  ASSERT_TRUE(Store && Store->OtherSink);
+  EXPECT_EQ(Store->OtherSink->Reason, EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(
+      flowsToDecl(thisFactOf("pass"), findFnByName("helper", Ctx), 0));
+  EXPECT_TRUE(flowsToDecl(thisFactOf("call"), findFnByName("other", Ctx),
+                          ThisParamIndex));
+  EXPECT_TRUE(isClean(thisFactOf("write")));
+  EXPECT_EQ(sinkOf("write", 0), EscapeReason::StoreToField);
+  const EscapeFact *Cap = thisFactOf("capture");
+  ASSERT_TRUE(Cap && Cap->OtherSink);
+  EXPECT_EQ(Cap->OtherSink->Reason, EscapeReason::Capture);
+  // The spellings that reach the object through `this` rather than naming it:
+  // an interior pointer, a cast to another pointer type, pointer arithmetic,
+  // and the return. Each arm is also pinned through a parameter source; these
+  // keep the `this` source itself honest.
+  const EscapeFact *Addr = thisFactOf("member_addr");
+  ASSERT_TRUE(Addr && Addr->OtherSink);
+  EXPECT_EQ(Addr->OtherSink->Reason, EscapeReason::StoreToGlobal);
+  const EscapeFact *Laundered = thisFactOf("launder");
+  ASSERT_TRUE(Laundered && Laundered->OtherSink);
+  EXPECT_EQ(Laundered->OtherSink->Reason, EscapeReason::StoreToGlobal);
+  const EscapeFact *Offset = thisFactOf("offset");
+  ASSERT_TRUE(Offset && Offset->OtherSink);
+  EXPECT_EQ(Offset->OtherSink->Reason, EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(thisFactOf("self")->returnsSelf());
 }
 
 } // namespace
