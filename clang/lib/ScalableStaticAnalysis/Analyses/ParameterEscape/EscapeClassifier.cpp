@@ -799,9 +799,6 @@ private:
         return true;
       return DynamicRecursiveASTVisitor::TraverseDecl(D);
     }
-    // A lambda's or block's body reaches an enclosing local only through a
-    // capture, and every capture of an alias is a sink, so nothing inside can
-    // grow the alias set.
     // A lambda's or block's *body* reaches an enclosing local only through a
     // capture, and every capture of an alias is a sink, so nothing inside it
     // can grow the alias set. An init-capture's initializer is different: it
@@ -812,7 +809,17 @@ private:
           return false;
       return true;
     }
-    bool TraverseBlockExpr(BlockExpr *) override { return true; }
+    // Same shape as the lambda above, for the same reason: the body is skipped,
+    // but a capture's *copy expression* runs in the enclosing function. See the
+    // UseVisitor's TraverseBlockExpr() for what puts an entire LambdaExpr --
+    // and with it an init-capture initializer this pass has to see -- inside
+    // one.
+    bool TraverseBlockExpr(BlockExpr *BE) override {
+      for (const BlockDecl::Capture &Cap : BE->getBlockDecl()->captures())
+        if (Cap.hasCopyExpr() && !TraverseStmt(Cap.getCopyExpr()))
+          return false;
+      return true;
+    }
     bool VisitVarDecl(VarDecl *VD) override {
       if (!VD->hasInit())
         return true;
@@ -929,11 +936,35 @@ private:
       return DynamicRecursiveASTVisitor::TraverseConstructorInitializer(Init);
     }
     bool TraverseBlockExpr(BlockExpr *BE) override {
-      for (const BlockDecl::Capture &Cap : BE->getBlockDecl()->captures())
+      const BlockDecl *BD = BE->getBlockDecl();
+      for (const BlockDecl::Capture &Cap : BD->captures())
         if (C.AliasVars.count(Cap.getVariable()))
           C.sink(EscapeReason::Capture, BE->getBeginLoc());
-      if (BE->getBlockDecl()->capturesCXXThis() && C.Src.isThis())
+      if (BD->capturesCXXThis() && C.Src.isThis())
         C.sink(EscapeReason::Capture, BE->getBeginLoc());
+      // The block's *body* is not traversed, for the same reason a lambda's is
+      // not: it reaches an enclosing local only through a capture, and every
+      // capture of an alias has just sunk. A capture's copy expression is a
+      // different thing entirely -- it is evaluated in the *enclosing*
+      // function, in terms of the captured variable -- and skipping it was
+      // unsound.
+      //
+      // The shape that makes it unsound is a C++ lambda converted to a block.
+      // Clang does not leave the LambdaExpr where it was written: it wraps the
+      // conversion in a BlockExpr whose BlockDecl captures a synthetic
+      // temporary of the *closure's* type, and hangs the LambdaExpr off that
+      // capture's copy expression. The loop above then asks whether that
+      // temporary is an alias -- it never is -- and the lambda's own captures,
+      // which are where the parameter actually goes, sat behind a `return
+      // true`. `Blk b = [p]{ ... }; g_blk = b;` reported no sink, no flow and
+      // no return: the shape that means "provably does not escape".
+      //
+      // Recorded after the direct captures so that first-sink-wins still
+      // reports the capture itself where there is one, rather than whatever
+      // the copy expression does with the same variable.
+      for (const BlockDecl::Capture &Cap : BD->captures())
+        if (Cap.hasCopyExpr() && !TraverseStmt(Cap.getCopyExpr()))
+          return false;
       return true;
     }
     // DynamicRecursiveASTVisitor has no VisitExpr.

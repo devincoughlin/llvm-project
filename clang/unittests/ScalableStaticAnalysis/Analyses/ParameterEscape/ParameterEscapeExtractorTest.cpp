@@ -2444,4 +2444,403 @@ TEST_F(ParameterEscapeExtractorTest, ViewMemberInitializerReachesTheSink) {
   EXPECT_TRUE(flowsToDecl(thisFactOfDecl(H2C), VC, ThisParamIndex));
 }
 
+//===--- Objective-C++, blocks and glvalue edge cases (#14) ---------------===//
+
+// M1 analyzes C and C++ functions in an Objective-C++ TU and models no
+// Objective-C construct: every one of them has to answer with a sink, because
+// a clean fact with no edges is the shape the fixpoint reads as "provably does
+// not escape".
+//
+// Enumerated over what the language offers rather than over the four spellings
+// the issue listed: messages, properties in both directions, subscripting in
+// both directions, @synchronized, @throw, boxed expressions, container
+// literals and fast enumeration. The Detail string is asserted with the
+// reason, so that "the default row fired on this shape" is distinguishable
+// from "the classifier produced nothing" -- and so that a future rule that
+// answered one of these by a *different* unmodelled shape shows up here.
+//
+// Deliberately not here, each because it forms no operand out of an alias:
+// @selector, @encode, @protocol, @available and the ObjC boolean literals.
+// Their C/C++ neighbours in the same function stay clean, which is correct.
+TEST_F(ParameterEscapeExtractorTest, ObjCConstructsAreSinks) {
+  ASSERT_TRUE(setUp(R"objc(
+@interface Foo
+- (void)take:(int *)p;
+- (id)objectAtIndexedSubscript:(unsigned)i;
+- (void)setObject:(id)o atIndexedSubscript:(unsigned)i;
+@property (assign) int *prop;
+@property (strong) id obj;
+@end
+@interface NSString
++ (NSString *)stringWithUTF8String:(const char *)s;
+@end
+@interface NSArray
++ (id)arrayWithObjects:(const id *)o count:(unsigned long)c;
+@end
+@interface NSDictionary
++ (id)dictionaryWithObjects:(const id *)o forKeys:(const id *)k count:(unsigned long)c;
+@end
+int *g_ptr;
+id g_obj;
+void message(Foo *o, int *p) { [o take:p]; }
+void propertyWrite(Foo *o, int *p) { o.prop = p; }
+void propertyRead(Foo *o) { g_ptr = o.prop; }
+void propertyObjWrite(Foo *o, id x) { o.obj = x; }
+void subscriptWrite(Foo *o, id x) { o[0] = x; }
+void subscriptRead(Foo *o) { g_obj = o[0]; }
+void synchronizedOn(Foo *o) { @synchronized(o) { } }
+void throwAlias(Foo *o) { @throw o; }
+void boxedPointer(const char *p) { g_obj = @(p); }
+void arrayLiteral(id o) { g_obj = @[o]; }
+void dictionaryLiteral(id k, id v) { g_obj = @{k : v}; }
+void fastEnumeration(Foo *c) { for (id x in c) { (void)x; } }
+void noOperandForms(int *p) { (void)@selector(take:); (void)@encode(int *);
+                              (void)__objc_yes; (void)*p; }
+)objc",
+                    {"-x", "objective-c++", "-std=c++20", "-fblocks",
+                     "-fobjc-arc"},
+                    /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("message", 0), EscapeReason::ObjCMessage);
+  EXPECT_EQ(sinkOf("message", 1), EscapeReason::ObjCMessage);
+
+  // A property access is a PseudoObjectExpr over an ObjCPropertyRefExpr; the
+  // receiver's use is the property reference itself, which nothing models.
+  auto detail = [&](StringRef Fn, unsigned I) -> std::string {
+    const EscapeFact *F = factOf(Fn, I);
+    return F && F->OtherSink ? F->OtherSink->Detail : std::string("<none>");
+  };
+  EXPECT_EQ(sinkOf("propertyWrite", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("propertyWrite", 0), "ObjCPropertyRefExpr");
+  // The stored value's own use: the assignment's left operand is not a
+  // variable and not a member, so the store is attributed to a pointer.
+  EXPECT_EQ(sinkOf("propertyWrite", 1), EscapeReason::StoreThroughPointer);
+  EXPECT_EQ(sinkOf("propertyRead", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("propertyRead", 0), "ObjCPropertyRefExpr");
+  EXPECT_EQ(sinkOf("propertyObjWrite", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(sinkOf("propertyObjWrite", 1), EscapeReason::StoreThroughPointer);
+
+  EXPECT_EQ(sinkOf("subscriptWrite", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("subscriptWrite", 0), "ObjCSubscriptRefExpr");
+  EXPECT_EQ(sinkOf("subscriptWrite", 1), EscapeReason::StoreThroughPointer);
+  EXPECT_EQ(sinkOf("subscriptRead", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("subscriptRead", 0), "ObjCSubscriptRefExpr");
+
+  EXPECT_EQ(sinkOf("synchronizedOn", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("synchronizedOn", 0), "ObjCAtSynchronizedStmt");
+  EXPECT_EQ(sinkOf("throwAlias", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("throwAlias", 0), "ObjCAtThrowStmt");
+  EXPECT_EQ(sinkOf("boxedPointer", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("boxedPointer", 0), "ObjCBoxedExpr");
+  EXPECT_EQ(sinkOf("arrayLiteral", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("arrayLiteral", 0), "ObjCArrayLiteral");
+  EXPECT_EQ(sinkOf("dictionaryLiteral", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("dictionaryLiteral", 0), "ObjCDictionaryLiteral");
+  EXPECT_EQ(sinkOf("dictionaryLiteral", 1), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(sinkOf("fastEnumeration", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_EQ(detail("fastEnumeration", 0), "ObjCForCollectionStmt");
+
+  // The forms that form no operand leave their C neighbours alone.
+  EXPECT_TRUE(clean("noOperandForms", 0));
+}
+
+// The ARC-specific spellings. The bridging casts preserve provenance -- a
+// bridged cast is a CastExpr whose result type is still pointer-carrying -- so
+// the alias survives them and its *store* is what sinks. The ownership
+// qualifiers are just qualifiers on ordinary local pointer storage.
+//
+// The statement forms that only scope a body -- @autoreleasepool, @try/@catch/
+// @finally, @synchronized -- must not swallow the uses inside them. Each is
+// asserted with the escaping body and with a benign one, so that "the body is
+// classified" is separated from "the statement is itself a sink".
+TEST_F(ParameterEscapeExtractorTest, ObjCARCBridgesQualifiersAndScopedBodies) {
+  ASSERT_TRUE(setUp(R"objc(
+@interface Foo @end
+int *g_ptr;
+id g_obj;
+void takesOut(Foo * __autoreleasing *out);
+void bridgeCast(void *p) { g_obj = (__bridge id)p; }
+void bridgeTransfer(void *p) { g_obj = (__bridge_transfer id)p; }
+void bridgeRetained(id o) { g_ptr = (int *)(__bridge_retained void *)o; }
+void weakLocal(Foo *o) { __weak Foo *w = o; g_obj = w; }
+void unsafeUnretainedLocal(Foo *o) { __unsafe_unretained Foo *w = o; g_obj = w; }
+void autoreleasingOut(Foo * __autoreleasing *o) { g_obj = *o; }
+void writeback(Foo *o) { Foo * __strong local = o; takesOut(&local); }
+void poolBody(int *p) { @autoreleasepool { g_ptr = p; } }
+void poolClean(int *p) { @autoreleasepool { (void)*p; } }
+void tryBody(int *p) { @try { g_ptr = p; } @catch (id e) { } }
+void catchBody(int *p) { @try { } @catch (id e) { g_ptr = p; } }
+void finallyBody(int *p) { @try { } @finally { g_ptr = p; } }
+void syncBody(Foo *o, int *p) { @synchronized(o) { g_ptr = p; } }
+void syncClean(Foo *o, int *p) { @synchronized(o) { (void)*p; } }
+)objc",
+                    {"-x", "objective-c++", "-std=c++20", "-fblocks",
+                     "-fobjc-arc"},
+                    /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("bridgeCast", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("bridgeTransfer", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("bridgeRetained", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("weakLocal", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("unsafeUnretainedLocal", 0), EscapeReason::StoreToGlobal);
+  // Reading the pointee of an `id *` is a load through a Place, which design
+  // section 1.1 makes fresh: what escapes is the object the slot held, not the
+  // slot the caller handed over. The same answer as `g = *pp` for `int **pp`.
+  EXPECT_TRUE(clean("autoreleasingOut", 0));
+  // ARC's write-back passes the address of a local, which is an ordinary
+  // address-taken escape of the local rather than an ObjC-specific shape.
+  EXPECT_EQ(sinkOf("writeback", 0), EscapeReason::AddressTaken);
+
+  EXPECT_EQ(sinkOf("poolBody", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(clean("poolClean", 0));
+  EXPECT_EQ(sinkOf("tryBody", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("catchBody", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("finallyBody", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("syncBody", 1), EscapeReason::StoreToGlobal);
+  // The @synchronized *operand* is still a sink whatever the body does.
+  EXPECT_EQ(sinkOf("syncClean", 0), EscapeReason::UnrecognizedUse);
+  EXPECT_TRUE(clean("syncClean", 1));
+}
+
+// Blocks, enumerated: a literal capturing the parameter directly, one whose
+// captured copy is taken by Block_copy, one stored into a global, one
+// returned, one nested in another, a block parameter of a C function that is
+// called, stored, passed on and passed to a `noescape` parameter, a block
+// called *with* the alias, and a capture of an alias held in a local rather
+// than in the parameter itself.
+TEST_F(ParameterEscapeExtractorTest, BlockShapes) {
+  ASSERT_TRUE(setUp(R"objc(
+int *g_ptr;
+typedef void (^Blk)(void);
+Blk g_blk;
+void takesBlock(Blk b);
+void takesBlockNoescape(__attribute__((noescape)) Blk b);
+extern "C" void *_Block_copy(const void *);
+void captured(int *p) { Blk b = ^{ (void)*p; }; (void)b; }
+void capturedStored(int *p) { g_blk = ^{ (void)*p; }; }
+void capturedCopied(int *p) { Blk b = (__bridge Blk)_Block_copy((__bridge const void *)^{ (void)*p; }); (void)b; }
+Blk capturedReturned(int *p) { return ^{ (void)*p; }; }
+void capturedNested(int *p) { Blk b = ^{ Blk c = ^{ (void)*p; }; (void)c; }; (void)b; }
+void capturedViaLocal(int *p) { int *q = p; Blk b = ^{ (void)*q; }; g_blk = b; }
+void noCapture(int *p) { Blk b = ^{ }; (void)b; (void)*p; }
+void blockCalled(Blk b) { b(); }
+void blockStored(Blk b) { g_blk = b; }
+void blockPassed(Blk b) { takesBlock(b); }
+void blockPassedNoescape(Blk b) { takesBlockNoescape(b); }
+void calledWithAlias(int *p) { void (^b)(int *) = ^(int *x) { (void)x; }; b(p); }
+struct S { int *f; void m() { g_blk = ^{ (void)f; }; } };
+)objc",
+                    {"-x", "objective-c++", "-std=c++20", "-fblocks",
+                     "-fobjc-arc"},
+                    /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("captured", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("capturedStored", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("capturedCopied", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("capturedReturned", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("capturedNested", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("capturedViaLocal", 0), EscapeReason::Capture);
+  // A block that captures nothing does not reach the parameter at all.
+  EXPECT_TRUE(clean("noCapture", 0));
+
+  // A block *parameter* is analyzed (its facts feed callers) though it is
+  // never a candidate, so each of these has to answer.
+  EXPECT_EQ(sinkOf("blockCalled", 0), EscapeReason::CallableUse);
+  EXPECT_EQ(sinkOf("blockStored", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(flowsTo("blockPassed", 0, "takesBlock", 0));
+  EXPECT_EQ(sinkOf("blockPassed", 0), std::nullopt);
+  // Declared `noescape` is one of the two trusted external sources.
+  EXPECT_TRUE(clean("blockPassedNoescape", 0));
+  // Calling through a block pointer is an indirect call: the body that runs is
+  // not in this TU.
+  EXPECT_EQ(sinkOf("calledWithAlias", 0), EscapeReason::IndirectCall);
+  EXPECT_EQ(sinkOfThisDecl(findFnByName("m", AST->getASTContext())),
+            EscapeReason::Capture);
+}
+
+// A C++ lambda converted to a block. Clang does not leave the LambdaExpr where
+// it was written: it wraps the conversion in a BlockExpr whose BlockDecl
+// captures a synthetic temporary of the closure's type, and hangs the
+// LambdaExpr off *that capture's copy expression*. Before #14 the block
+// traversal looked only at the captured variables -- the temporary, which is
+// never an alias -- and returned without descending, so every one of these
+// reported no sink, no flow and no return: the shape the fixpoint reads as
+// "provably does not escape" and CodeGen lowers to `captures(none)`.
+//
+// All four spellings that put a parameter inside such a closure are here: by
+// copy, by reference, `this`, and an init-capture whose *initializer* runs in
+// the enclosing function and so must still grow the alias set.
+TEST_F(ParameterEscapeExtractorTest, LambdaConvertedToBlockIsACapture) {
+  ASSERT_TRUE(setUp(R"objc(
+int *g_ptr;
+typedef void (^Blk)(void);
+Blk g_blk;
+void byCopy(int *p) { Blk b = [p]() { (void)*p; }; g_blk = b; }
+void byReference(int *p) { Blk b = [&p]() { (void)*p; }; g_blk = b; }
+struct S { int *f;
+  void byThis() { Blk b = [this]() { (void)f; }; g_blk = b; }
+  void byStarThis() { Blk b = [*this]() { (void)f; }; g_blk = b; } };
+void initCaptureGrowth(int *p) { int *q = nullptr;
+  Blk b = [n = (q = p, 0)]() { (void)n; }; g_blk = b; g_ptr = q; }
+void viaLocalClosure(int *p) { auto l = [p]() { (void)*p; }; Blk b = l; g_blk = b; }
+void closureOfLocalAlias(int *p) { int *q = p; Blk b = [q]() { (void)*q; }; g_blk = b; }
+void emptyClosure(int *p) { Blk b = []() { }; g_blk = b; (void)*p; }
+)objc",
+                    {"-x", "objective-c++", "-std=c++20", "-fblocks",
+                     "-fobjc-arc"},
+                    /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("byCopy", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("byReference", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOfThisDecl(findFnByName("byThis", AST->getASTContext())),
+            EscapeReason::Capture);
+  EXPECT_EQ(sinkOfThisDecl(findFnByName("byStarThis", AST->getASTContext())),
+            EscapeReason::Capture);
+  // Not a Capture: `p` reaches no closure. It reaches `q`, and the growth pass
+  // only sees that through the same traversal -- without it `q` never joins
+  // the alias set and the store two statements later is invisible.
+  //
+  // Measured by removing the growth pass's traversal alone: with assertions on
+  // this case does not merely go clean, it aborts on classifyStoreInto()'s
+  // "must have joined the alias set during the growth pass" assertion, which
+  // is that assertion's whole purpose. Assertions off, it is a silent clean.
+  EXPECT_EQ(sinkOf("initCaptureGrowth", 0), EscapeReason::StoreToGlobal);
+  // Written out rather than converted in place, so the LambdaExpr is a direct
+  // child of the declaration and the ordinary lambda rule sees it. Here to
+  // separate "a closure that captures p is a Capture" from "the conversion
+  // hides it": removing the block traversal leaves this one green.
+  EXPECT_EQ(sinkOf("viaLocalClosure", 0), EscapeReason::Capture);
+  EXPECT_EQ(sinkOf("closureOfLocalAlias", 0), EscapeReason::Capture);
+  // A closure that captures nothing still converts to a block; nothing of the
+  // parameter is in it, so the conversion must not invent an escape either.
+  EXPECT_TRUE(clean("emptyClosure", 0));
+}
+
+// The glvalue rows of design section 5.2, over the shapes that make a glvalue
+// out of an alias: a reference bound to the pointee, a reference *parameter*
+// whose referent's address is taken, a call returning a reference to a
+// pointer, a conditional, a comma, a range-for, a std::move-like reference
+// cast, an unknown callee, a defaulted parameter and a nested lambda.
+//
+// The pairs matter more than the individual answers: each escaping spelling is
+// asserted next to the neighbouring benign one, because what separates them is
+// a single rule -- a load through a Place is fresh, its address is not.
+TEST_F(ParameterEscapeExtractorTest, GlvalueEdgeCases) {
+  ASSERT_TRUE(setUp(R"cpp(
+int *g_ptr;
+struct Sub { int m; int *pm; };
+int *&slot(int *);
+void unknownFn(int *);
+void hasDefaultArg(int *a, int *b = nullptr);
+namespace std { template <class T> struct rr { typedef T type; };
+  template <class T> typename rr<T>::type &&move(T &t) noexcept; }
+struct It { int *p; int &operator*(); It &operator++(); bool operator!=(const It &) const; };
+struct Range { It begin(); It end(); };
+void refToPointeeAddress(int *p) { int &r = *p; g_ptr = &r; }
+void refToPointeeWrite(int *p) { int &r = *p; r = 1; }
+void refParamFieldAddress(Sub &s) { g_ptr = &s.m; }
+void refParamFieldRead(Sub &s) { int x = s.m; (void)x; }
+void refParamFieldLoad(Sub &s) { g_ptr = s.pm; }
+void glvalueCallResult(int *p) { g_ptr = slot(p); }
+void glvalueCallTarget(int *p) { slot(p) = p; }
+void conditional(int c, int *p, int *q) { g_ptr = c ? p : q; }
+void conditionalCondition(int *p) { g_ptr = p ? g_ptr : nullptr; }
+void commaOperand(int *p) { g_ptr = (0, p); }
+void rangeForOverPointee(Range *r) { for (int &x : *r) { (void)x; } }
+void moveLikeCast(int *p) { g_ptr = std::move(p); }
+void moveLikeCastAlone(int *p) { (void)std::move(p); }
+void unknownCallee(int *p) { unknownFn(p); }
+void defaultedTail(int *p) { hasDefaultArg(p); }
+void defaultedSecond(int *p) { hasDefaultArg(nullptr, p); }
+void nestedLambda(int *p) { auto o = [&] { auto i = [p] { (void)*p; }; (void)i; }; (void)o; }
+)cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("refToPointeeAddress", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(clean("refToPointeeWrite", 0));
+  EXPECT_EQ(sinkOf("refParamFieldAddress", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(clean("refParamFieldRead", 0));
+  // Reading a pointer *out of* the referent is a load through a Place.
+  EXPECT_TRUE(clean("refParamFieldLoad", 0));
+
+  // A glvalue call result whose referent is pointer-carrying is an alias, so
+  // reading it stores the alias and assigning to it stores through a pointer.
+  // Both also record the flow into slot()'s own parameter, which is what the
+  // fixpoint closes; asserting it keeps the sink from hiding a dropped edge.
+  EXPECT_EQ(sinkOf("glvalueCallResult", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(flowsTo("glvalueCallResult", 0, "slot", 0));
+  EXPECT_EQ(sinkOf("glvalueCallTarget", 0), EscapeReason::StoreThroughPointer);
+  EXPECT_TRUE(flowsTo("glvalueCallTarget", 0, "slot", 0));
+
+  EXPECT_EQ(sinkOf("conditional", 1), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("conditional", 2), EscapeReason::StoreToGlobal);
+  // Only the branches carry the value; the condition merely reads it.
+  EXPECT_TRUE(clean("conditionalCondition", 0));
+  EXPECT_EQ(sinkOf("commaOperand", 0), EscapeReason::StoreToGlobal);
+
+  // A range-for calls begin() and end() on the pointee; the alias is their
+  // implicit object argument, and neither is a sink of its own.
+  EXPECT_EQ(sinkOf("rangeForOverPointee", 0), std::nullopt);
+  EXPECT_TRUE(flowsTo("rangeForOverPointee", 0, "begin", ThisParamIndex));
+  EXPECT_TRUE(flowsTo("rangeForOverPointee", 0, "end", ThisParamIndex));
+
+  // A std::move-like cast re-types its operand and keeps the alias, recording
+  // no flow of its own -- clang models these as builtins the entity model
+  // refuses to name, so a flow would degrade to UnnamedCallee.
+  EXPECT_EQ(sinkOf("moveLikeCast", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(clean("moveLikeCastAlone", 0));
+
+  // An unknown callee is a flow, not a sink: the fixpoint resolves it.
+  EXPECT_FALSE(clean("unknownCallee", 0));
+  EXPECT_EQ(sinkOf("unknownCallee", 0), std::nullopt);
+  EXPECT_TRUE(flowsTo("unknownCallee", 0, "unknownFn", 0));
+
+  // A defaulted parameter does not disturb positional matching in either
+  // direction: an omitted tail, and an explicit argument in the defaulted slot.
+  EXPECT_EQ(sinkOf("defaultedTail", 0), std::nullopt);
+  EXPECT_TRUE(flowsTo("defaultedTail", 0, "hasDefaultArg", 0));
+  EXPECT_EQ(sinkOf("defaultedSecond", 0), std::nullopt);
+  EXPECT_TRUE(flowsTo("defaultedSecond", 0, "hasDefaultArg", 1));
+
+  EXPECT_EQ(sinkOf("nestedLambda", 0), EscapeReason::Capture);
+}
+
+// The glvalue rows again, over the reference shapes a *parameter* can be.
+// Separated from the test above because these are about what a reference
+// parameter denotes rather than about what makes a glvalue out of a pointer.
+TEST_F(ParameterEscapeExtractorTest, ReferenceParameterGlvalues) {
+  ASSERT_TRUE(setUp(R"cpp(
+int *g_ptr;
+struct B { int m; virtual ~B(); };
+struct D : B { };
+void refToReferentAddress(int &r) { g_ptr = &r; }
+void refToReferentRead(int &r) { int x = r; (void)x; }
+void refToPointerRead(int *&r) { g_ptr = r; }
+void refToPointerWrite(int *&r) { r = g_ptr; }
+void refToPointerAddress(int *&r) { g_ptr = (int *)&r; }
+void refStaticCast(D &d) { B &b = static_cast<B &>(d); g_ptr = &b.m; }
+void refDynamicCast(B &b) { D &d = dynamic_cast<D &>(b); g_ptr = &d.m; }
+void refReinterpretRead(int &r) { long &l = reinterpret_cast<long &>(r); (void)l; }
+void arrayReference(int (&a)[4]) { g_ptr = a; }
+void localRefToPointerVar(int *p) { int *&r = p; g_ptr = r; }
+)cpp",
+                    {"-std=c++20"}, /*WithPrelude=*/false));
+  EXPECT_EQ(sinkOf("refToReferentAddress", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(clean("refToReferentRead", 0));
+  // A reference to a *pointer* denotes storage holding an alias, not the
+  // pointee object, so loading it yields the alias -- not the fresh value a
+  // load through a Place yields. That is the conservative direction: it can
+  // only add sinks to a parameter whose `noescape` would be a promise about
+  // the reference rather than about what the slot happens to hold.
+  EXPECT_EQ(sinkOf("refToPointerRead", 0), EscapeReason::StoreToGlobal);
+  // Writing through a reference parameter writes the referent, which this
+  // analysis does not track; the reference itself has not escaped.
+  EXPECT_TRUE(clean("refToPointerWrite", 0));
+  // Taking the address of the reference exposes the slot itself.
+  EXPECT_EQ(sinkOf("refToPointerAddress", 0), EscapeReason::AddressTaken);
+  // A reference cast denotes the same object, so an interior pointer out of
+  // the result is still derived from the parameter.
+  EXPECT_EQ(sinkOf("refStaticCast", 0), EscapeReason::StoreToGlobal);
+  EXPECT_EQ(sinkOf("refDynamicCast", 0), EscapeReason::StoreToGlobal);
+  EXPECT_TRUE(clean("refReinterpretRead", 0));
+  EXPECT_EQ(sinkOf("arrayReference", 0), EscapeReason::StoreToGlobal);
+  // Binding a local reference to the pointer *variable* exposes the storage.
+  EXPECT_EQ(sinkOf("localRefToPointerVar", 0), EscapeReason::AddressTaken);
+}
+
 } // namespace
