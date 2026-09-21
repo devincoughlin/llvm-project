@@ -35,3 +35,12 @@ int *backing;
 int *&out = backing;
 
 void escape(int *p) { out = p; }
+
+// Runtime half; see store-to-global.cpp for what the driver is for. The read
+// is through `backing` rather than through `out`, so the report also shows the
+// reference really did denote the global.
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = backing; }
+// DRIVER:   return *k;
+// DRIVER: }

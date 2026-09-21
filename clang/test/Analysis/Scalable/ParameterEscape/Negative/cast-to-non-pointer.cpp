@@ -31,3 +31,12 @@
 // CHECK-NEXT: ]
 
 long escape(int *p) { return (long)p; }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. The integer
+// the cast produces is carried out of the scope and cast back, which is
+// exactly why an integer round trip has to be treated as an escape.
+// DRIVER: long leak;
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; leak = escape(&local); }
+// DRIVER:   return *(int *)leak;
+// DRIVER: }

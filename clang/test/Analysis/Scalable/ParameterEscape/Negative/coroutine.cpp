@@ -56,3 +56,10 @@ Task escape(int *p) {
   (void)*p;
   co_return;
 }
+
+// No runtime driver. Both suspend points are `suspend_never`, so the coroutine
+// runs to completion and destroys its frame before `escape` returns: as
+// written, the parameter never outlives the call and there is nothing to
+// observe. A coroutine that actually suspends would be a true escape, but it
+// would be a different program from the one this file classifies.
+// NO-DRIVER: suspend_never runs the frame to completion inside the call

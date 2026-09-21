@@ -33,3 +33,13 @@
 void take(int **);
 
 void escape(int *p) { take(&p); }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. `take`
+// receives the address of the parameter slot and reads the pointer out of it,
+// which is the escape this file asserts.
+// DRIVER: int *leak;
+// DRIVER: void take(int **pp) { leak = *pp; }
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; escape(&local); }
+// DRIVER:   return *leak;
+// DRIVER: }

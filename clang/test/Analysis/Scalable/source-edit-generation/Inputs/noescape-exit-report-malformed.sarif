@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/cos02/schemas/sarif-schema-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "note",
+          "message": {
+            "text": "parameter 0 of c:@F@wellformed#*I# not annotated: StoreToGlobal at fixture.cpp:3:7 (g)"
+          },
+          "ruleId": "noescape-rejected"
+        },
+        {
+          "level": "note",
+          "message": {
+            "text": "parameter 0 of c:@F@reshaped#*I# was not annotated because StoreToGlobal"
+          },
+          "ruleId": "noescape-rejected"
+        }
+      ],
+      "tool": { "driver": { "name": "hand-written fixture" } },
+      "version": "2.1.0"
+    }
+  ],
+  "version": "2.1.0"
+}

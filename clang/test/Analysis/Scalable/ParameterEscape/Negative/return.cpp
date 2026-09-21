@@ -32,3 +32,18 @@
 // CHECK-NEXT: ]
 
 int *escape(int *p) { return p; }
+
+// Runtime half; see store-to-global.cpp for what the driver is for.
+//
+// `k` is `volatile` here and nowhere else in the corpus, and it has to be:
+// with a plain `int *k` this driver produces *no* ASan report at -O2, measured.
+// Nothing in it touches memory the optimizer cannot see through -- `escape` is
+// the identity on a pointer to a local -- so the load is forwarded to `local`
+// and sunk back inside its lifetime, and the dangling read stops existing. It
+// does report at -O0. An escape the optimizer can delete was never observable,
+// so the driver stores through a volatile slot to keep it.
+// DRIVER: int main() {
+// DRIVER:   int *volatile k;
+// DRIVER:   { int local = 1; k = escape(&local); }
+// DRIVER:   return *k;
+// DRIVER: }

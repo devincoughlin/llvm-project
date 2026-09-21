@@ -1,5 +1,5 @@
 // A call through a function pointer has no callee declaration to attribute the
-// argument to. The function-pointer parameter is analyzed but is not itself a
+// argument to. The function-pointer parameter is neither analyzed nor a
 // candidate, so the only rejection is the object pointer's.
 
 // RUN: rm -rf %t && mkdir -p %t
@@ -32,3 +32,19 @@
 // CHECK-NEXT: ]
 
 void escape(int *p, void (*fn)(int *)) { fn(p); }
+
+// "Neither analyzed nor a candidate" is exact, and was wrong here until it was
+// measured: isPointerCarryingType() excludes isFunctionPointerType(), so no
+// fact is recorded for `fn` at all and it is absent from the summary's
+// `params` array -- not merely excluded from `candidate_params`. A function
+// *reference* is the other way round: analyzed, and not a candidate.
+//
+// Runtime half; see store-to-global.cpp for what a driver is for. The function
+// the driver passes is one that retains -- which is the whole point of
+// refusing an indirect call: nothing at the call site says which it will be.
+// DRIVER: int *leak;
+// DRIVER: static void keep(int *q) { leak = q; }
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; escape(&local, keep); }
+// DRIVER:   return *leak;
+// DRIVER: }

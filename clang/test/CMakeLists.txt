@@ -283,3 +283,68 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/debuginfo-tests)
 endif()
 
 add_subdirectory(Analysis/LifetimeSafety)
+
+# The ParameterEscape negative corpus, validated against AddressSanitizer
+# rather than against this analysis.  Not part of check-clang: it builds and
+# runs programs, and it needs a compiler with an ASan runtime, which a clang
+# configured without compiler-rt does not have.
+#
+# So the compiler is probed for rather than assumed.  The clang this build
+# produces is preferred and cannot be tested here -- it does not exist at
+# configure time -- so it is used whenever compiler-rt is being built, and
+# otherwise a host compiler that can actually link `-fsanitize=address` is
+# found by compiling a one-line program with each candidate.  Set
+# CLANG_SSAF_ESCAPE_CORPUS_CLANG to override.
+#
+# The script refuses to run at all when the compiler it ends up with cannot
+# report a stack-use-after-scope, so a machine with no ASan anywhere fails
+# loudly instead of validating nothing.
+#
+# Not a genex in the cache: a `$<TARGET_FILE:clang>` stored in a CACHE STRING
+# shows up as literal genex text in ccmake and is destroyed by any user edit.
+set(CLANG_SSAF_ESCAPE_CORPUS_CLANG "" CACHE STRING
+  "Compiler used to build the ParameterEscape escape-corpus programs. \
+Empty means: the in-tree clang when compiler-rt is enabled, else a probed host compiler.")
+
+if(CLANG_SSAF_ESCAPE_CORPUS_CLANG)
+  set(_ssaf_corpus_clang "${CLANG_SSAF_ESCAPE_CORPUS_CLANG}")
+elseif("compiler-rt" IN_LIST LLVM_ENABLE_RUNTIMES OR
+       "compiler-rt" IN_LIST LLVM_ENABLE_PROJECTS)
+  set(_ssaf_corpus_clang "$<TARGET_FILE:clang>")
+else()
+  set(_ssaf_corpus_clang "")
+  set(_ssaf_asan_probe "${CMAKE_CURRENT_BINARY_DIR}/ssaf-asan-probe.c")
+  file(WRITE "${_ssaf_asan_probe}" "int main(void) { return 0; }\n")
+  foreach(_cand "${CMAKE_C_COMPILER}" "clang" "cc")
+    if(_cand AND NOT _ssaf_corpus_clang)
+      find_program(_ssaf_cand_path NAMES "${_cand}")
+      if(_ssaf_cand_path)
+        execute_process(
+          COMMAND "${_ssaf_cand_path}" -fsanitize=address -x c
+                  "${_ssaf_asan_probe}"
+                  -o "${CMAKE_CURRENT_BINARY_DIR}/ssaf-asan-probe.out"
+          RESULT_VARIABLE _ssaf_probe_rc
+          OUTPUT_QUIET ERROR_QUIET)
+        if(_ssaf_probe_rc EQUAL 0)
+          set(_ssaf_corpus_clang "${_ssaf_cand_path}")
+        endif()
+      endif()
+      unset(_ssaf_cand_path CACHE)
+    endif()
+  endforeach()
+  if(NOT _ssaf_corpus_clang)
+    # Nothing here can link ASan.  Point the target at the in-tree clang so it
+    # reports the missing runtime itself rather than reporting nothing.
+    set(_ssaf_corpus_clang "$<TARGET_FILE:clang>")
+  endif()
+endif()
+
+add_custom_target(check-clang-ssaf-escape-corpus
+  COMMAND "${Python3_EXECUTABLE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../utils/ssaf/validate_escape_corpus.py"
+          "${_ssaf_corpus_clang}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/Analysis/Scalable/ParameterEscape/Negative"
+  DEPENDS clang
+  COMMENT "Validating the ParameterEscape negative corpus under AddressSanitizer"
+  USES_TERMINAL)
+set_target_properties(check-clang-ssaf-escape-corpus PROPERTIES FOLDER "Clang/Tests")

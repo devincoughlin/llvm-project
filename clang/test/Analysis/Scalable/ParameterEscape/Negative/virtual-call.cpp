@@ -38,3 +38,13 @@ struct Base {
 Base receiver;
 
 void escape(int *p) { receiver.take(p); }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. `Base::take`
+// is left bodiless by this file; the driver defines the override that runs and
+// makes it retain, which is what the analysis cannot know at the call site.
+// DRIVER: int *leak;
+// DRIVER: void Base::take(int *q) { leak = q; }
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; escape(&local); }
+// DRIVER:   return *leak;
+// DRIVER: }

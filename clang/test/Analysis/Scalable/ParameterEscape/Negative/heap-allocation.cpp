@@ -35,3 +35,13 @@ struct Node {
 };
 
 Node *escape(int *p) { return new Node(p); }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. `Node`'s
+// constructor is left bodiless by this file; the driver defines it so that the
+// heap object really does retain the pointer it was handed.
+// DRIVER: int *leak;
+// DRIVER: Node::Node(int *p) { leak = p; }
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; (void)escape(&local); }
+// DRIVER:   return *leak;
+// DRIVER: }

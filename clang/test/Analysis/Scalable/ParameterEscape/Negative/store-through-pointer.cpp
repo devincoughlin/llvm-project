@@ -34,3 +34,14 @@
 int **slot;
 
 void escape(int *p) { *slot = p; }
+
+// Runtime half; see store-to-global.cpp for what the driver is for. `slot` is
+// null as written, so the driver has to point it at something that outlives
+// the scope before it can demonstrate anything.
+// DRIVER: int *holder;
+// DRIVER: int main() {
+// DRIVER:   slot = &holder;
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = holder; }
+// DRIVER:   return *k;
+// DRIVER: }

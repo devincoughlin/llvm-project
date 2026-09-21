@@ -30,3 +30,10 @@
 // CHECK-NEXT: ]
 
 void escape(int *p) { asm volatile("" ::"r"(p)); }
+
+// No runtime driver. The asm template is empty and stores nothing, so the
+// operand is consumed and never read back: there is no dereference of a dead
+// object for AddressSanitizer to trap on. The refusal is because the analysis
+// cannot see inside an asm block at all, not because this particular asm
+// retains anything.
+// NO-DRIVER: an empty asm template retains nothing to read back

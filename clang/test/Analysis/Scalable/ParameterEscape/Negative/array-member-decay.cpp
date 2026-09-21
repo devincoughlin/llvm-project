@@ -38,3 +38,11 @@ struct Box {
 Box box;
 
 void escape(int *p) { box.slots[1] = p; }
+
+// Runtime half; see store-to-global.cpp for what the driver is for. The read
+// comes back out of the same array element the store went into.
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = box.slots[1]; }
+// DRIVER:   return *k;
+// DRIVER: }

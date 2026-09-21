@@ -82,3 +82,18 @@ void *sink;
 template <class T> void store(T *p) { sink = (void *)p; }
 
 void use(int *a, char *b) { store(a); store(b); }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. `use` calls
+// `store` twice and the second call wins, so the object the driver reads back
+// is the `char` -- which is why it, and not the `int`, is the one named
+// `local`.
+//
+// So the driver observes **one** of the two rejections asserted above: `b`,
+// through the `store<char>` instantiation. `a`'s escape through `store<int>`
+// is the same shape and is not separately demonstrated -- a single global sink
+// can only hold one of them, and reordering the calls would just swap which.
+// The ASan report is on a 1-byte object, which is how to tell which one it is.
+// DRIVER: int main() {
+// DRIVER:   { int first = 1; char local = 'x'; use(&first, &local); }
+// DRIVER:   return *(char *)sink;
+// DRIVER: }

@@ -33,3 +33,14 @@
 int *g;
 
 void escape(int *p) { g = p; }
+
+// The runtime half of this file. `validate_escape_corpus.py` compiles the code
+// above together with the `main` below at -O2 under AddressSanitizer and
+// requires a report: that is what makes this file a *true* escape rather than
+// merely a program this analysis rejects. The driver lives at the end so that
+// adding it shifts none of the line numbers the CHECK lines pin.
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = g; }
+// DRIVER:   return *k;
+// DRIVER: }

@@ -1,0 +1,272 @@
+{
+  "type": "WPASuite",
+  "id_table": [
+    {
+      "id": 0,
+      "name": {
+        "namespace": [
+          {
+            "kind": "LinkUnit",
+            "name": "lu"
+          }
+        ],
+        "suffix": "",
+        "usr": "c:@F@f#*I#I#"
+      }
+    },
+    {
+      "id": 1,
+      "name": {
+        "namespace": [
+          {
+            "kind": "LinkUnit",
+            "name": "lu"
+          }
+        ],
+        "suffix": "",
+        "usr": "c:@F@g#*I#S0_#S0_#S0_#"
+      }
+    },
+    {
+      "id": 2,
+      "name": {
+        "namespace": [
+          {
+            "kind": "LinkUnit",
+            "name": "lu"
+          }
+        ],
+        "suffix": "",
+        "usr": "c:@F@h#*I#S0_#S0_#"
+      }
+    },
+    {
+      "id": 3,
+      "name": {
+        "namespace": [
+          {
+            "kind": "LinkUnit",
+            "name": "lu"
+          }
+        ],
+        "suffix": "",
+        "usr": "c:@F@k#*I#"
+      }
+    },
+    {
+      "id": 4,
+      "name": {
+        "namespace": [
+          {
+            "kind": "LinkUnit",
+            "name": "lu"
+          }
+        ],
+        "suffix": "",
+        "usr": "c:@F@m#*I#"
+      }
+    },
+    {
+      "id": 5,
+      "name": {
+        "namespace": [
+          {
+            "kind": "LinkUnit",
+            "name": "lu"
+          }
+        ],
+        "suffix": "",
+        "usr": "c:@F@n#*I#"
+      }
+    }
+  ],
+  "results": [
+    {
+      "analysis_name": "NonEscapingParametersResult",
+      "result": {
+        "NonEscapingParametersResult": {
+          "non_escaping": [
+            {
+              "function": {
+                "@": 0
+              },
+              "params": [
+                0
+              ]
+            }
+          ],
+          "rejected": [
+            {
+              "detail": "ga",
+              "location": {
+                "column": 21,
+                "file": "exit-report.cpp",
+                "line": 121
+              },
+              "node": {
+                "function": {
+                  "@": 1
+                },
+                "param": 0
+              },
+              "reason": "StoreToGlobal"
+            },
+            {
+              "detail": "gb",
+              "location": {
+                "column": 32,
+                "file": "exit-report.cpp",
+                "line": 122
+              },
+              "node": {
+                "function": {
+                  "@": 1
+                },
+                "param": 1
+              },
+              "reason": "StoreToGlobal"
+            },
+            {
+              "detail": "gc",
+              "location": {
+                "column": 43,
+                "file": "exit-report.cpp",
+                "line": 123
+              },
+              "node": {
+                "function": {
+                  "@": 1
+                },
+                "param": 2
+              },
+              "reason": "StoreToGlobal"
+            },
+            {
+              "detail": "gd",
+              "location": {
+                "column": 54,
+                "file": "exit-report.cpp",
+                "line": 124
+              },
+              "node": {
+                "function": {
+                  "@": 1
+                },
+                "param": 3
+              },
+              "reason": "StoreToGlobal"
+            },
+            {
+              "detail": "first",
+              "location": {
+                "column": 24,
+                "file": "exit-report.cpp",
+                "line": 114
+              },
+              "node": {
+                "function": {
+                  "@": 2
+                },
+                "param": 0
+              },
+              "reason": "StoreToField"
+            },
+            {
+              "detail": "second",
+              "location": {
+                "column": 35,
+                "file": "exit-report.cpp",
+                "line": 115
+              },
+              "node": {
+                "function": {
+                  "@": 2
+                },
+                "param": 1
+              },
+              "reason": "StoreToField"
+            },
+            {
+              "detail": "third",
+              "location": {
+                "column": 46,
+                "file": "exit-report.cpp",
+                "line": 116
+              },
+              "node": {
+                "function": {
+                  "@": 2
+                },
+                "param": 2
+              },
+              "reason": "StoreToField"
+            },
+            {
+              "blame": {
+                "function": {
+                  "@": 1
+                },
+                "param": 0
+              },
+              "detail": "",
+              "location": {
+                "column": 17,
+                "file": "exit-report.cpp",
+                "line": 108
+              },
+              "node": {
+                "function": {
+                  "@": 3
+                },
+                "param": 0
+              },
+              "reason": "EscapesViaCallee"
+            },
+            {
+              "blame": {
+                "function": {
+                  "@": 1
+                },
+                "param": 0
+              },
+              "detail": "",
+              "location": {
+                "column": 28,
+                "file": "exit-report.cpp",
+                "line": 110
+              },
+              "node": {
+                "function": {
+                  "@": 4
+                },
+                "param": 0
+              },
+              "reason": "EscapesViaCallee"
+            },
+            {
+              "blame": {
+                "function": {
+                  "@": 1
+                },
+                "param": 1
+              },
+              "detail": "",
+              "location": {
+                "column": 19,
+                "file": "exit-report.cpp",
+                "line": 104
+              },
+              "node": {
+                "function": {
+                  "@": 5
+                },
+                "param": 0
+              },
+              "reason": "UnanalyzedCallee"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

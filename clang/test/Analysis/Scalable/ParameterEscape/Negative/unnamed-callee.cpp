@@ -47,3 +47,16 @@ struct Outer {
 void take(Outer);
 
 void escape(Outer &o) { take(o); }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. The escape
+// is through the copy constructor the analysis cannot name: the driver defines
+// it to retain the address of the object it copied from, which is a subobject
+// of the caller's `local`.
+// DRIVER: int *leak;
+// DRIVER: Inner::Inner() {}
+// DRIVER: Inner::Inner(const Inner &other) { leak = (int *)&other; }
+// DRIVER: void take(Outer) {}
+// DRIVER: int main() {
+// DRIVER:   { Outer local; escape(local); }
+// DRIVER:   return *leak;
+// DRIVER: }

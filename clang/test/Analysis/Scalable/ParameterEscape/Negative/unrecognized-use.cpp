@@ -43,3 +43,14 @@ void escape(Table *t) {
   auto member = &Table::run;
   (t->*member)();
 }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. The call
+// through the member pointer reaches `Table::run`, which the driver defines to
+// retain `this` -- so the pointer-to-member call really does hand the object
+// out.
+// DRIVER: int *leak;
+// DRIVER: void Table::run() { leak = (int *)this; }
+// DRIVER: int main() {
+// DRIVER:   { Table local; escape(&local); }
+// DRIVER:   return *leak;
+// DRIVER: }

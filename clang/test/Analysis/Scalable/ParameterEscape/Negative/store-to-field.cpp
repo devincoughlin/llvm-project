@@ -34,3 +34,12 @@ struct Slot {
   int *held;
   void keep(int *p) { held = p; }
 };
+
+// Runtime half; see store-to-global.cpp for what the driver is for. The object
+// is a global so that `held` outlives the scope `local` is declared in.
+// DRIVER: Slot s;
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; s.keep(&local); k = s.held; }
+// DRIVER:   return *k;
+// DRIVER: }

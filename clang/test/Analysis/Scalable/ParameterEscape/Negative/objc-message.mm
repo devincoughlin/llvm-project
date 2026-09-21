@@ -36,3 +36,9 @@
 @end
 
 void escape(Keeper *k, int *p) { [k keep:p]; }
+
+// No runtime driver. `Keeper` is declared as a root class with no
+// `@implementation` and no base, so nothing in a driver can allocate a
+// receiver to send the message to; supplying one would mean rewriting the
+// interface this file exists to classify.
+// NO-DRIVER: the receiver class cannot be instantiated as declared

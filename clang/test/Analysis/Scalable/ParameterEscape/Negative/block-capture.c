@@ -33,3 +33,10 @@
 void take(void (^)(void));
 
 void escape(int *p) { take(^{ (void)*p; }); }
+
+// No runtime driver, measured rather than assumed. A driver can define `take`
+// to `Block_copy` the block and invoke it after the scope ends, but the
+// block's only use of the pointer is `(void)*p`, a discarded load that -O2
+// deletes, so the program reports nothing. Making it observable would mean
+// changing the body this file exists to classify.
+// NO-DRIVER: the block's only use of the pointer is a load -O2 deletes

@@ -84,3 +84,12 @@ int *g_labelled;
 void escape(int *p) { g = ({ p; }); }
 
 void escape_labelled(int *p) { g_labelled = ({ lbl : p; }); }
+
+// Runtime half; see store-to-global.cpp for what the driver is for. It drives
+// the unlabelled `escape`; `escape_labelled` exists for the classifier
+// measurement described at the top and stores into a second global.
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = g; }
+// DRIVER:   return *k;
+// DRIVER: }

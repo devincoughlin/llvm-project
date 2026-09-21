@@ -34,3 +34,20 @@
 void report(int, ...);
 
 void escape(int *p) { report(1, p); }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. `report` is
+// left bodiless by this file, so the driver supplies the definition -- and
+// reading the pointer back out with `va_arg` is what makes the escape through
+// the variadic tail observable.
+// DRIVER: #include <cstdarg>
+// DRIVER: int *leak;
+// DRIVER: void report(int n, ...) {
+// DRIVER:   va_list ap;
+// DRIVER:   va_start(ap, n);
+// DRIVER:   leak = va_arg(ap, int *);
+// DRIVER:   va_end(ap);
+// DRIVER: }
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; escape(&local); }
+// DRIVER:   return *leak;
+// DRIVER: }

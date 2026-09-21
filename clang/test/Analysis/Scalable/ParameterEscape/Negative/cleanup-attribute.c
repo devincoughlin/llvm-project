@@ -34,3 +34,13 @@
 void dtor(int **);
 
 void escape(int *p) { int *q __attribute__((cleanup(dtor))) = p; }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. The cleanup
+// function runs at the end of `escape` and is handed the address of the local
+// holding the parameter; the driver defines it to retain what it finds there.
+// DRIVER: int *leak;
+// DRIVER: void dtor(int **pq) { leak = *pq; }
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; escape(&local); }
+// DRIVER:   return *leak;
+// DRIVER: }

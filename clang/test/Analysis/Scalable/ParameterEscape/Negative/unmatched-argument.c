@@ -34,3 +34,14 @@
 void legacy();
 
 void escape(int *p) { legacy(p); }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. The
+// unprototyped declaration is what stops the argument being matched to a
+// parameter; the definition the driver supplies shows there was a parameter
+// all along, and that it retains.
+// DRIVER: int *leak;
+// DRIVER: void legacy(int *q) { leak = q; }
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; escape(&local); }
+// DRIVER:   return *leak;
+// DRIVER: }

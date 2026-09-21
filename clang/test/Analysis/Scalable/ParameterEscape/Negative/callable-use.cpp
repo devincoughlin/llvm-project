@@ -38,3 +38,11 @@ struct Table {
 };
 
 void escape(Table *t) { t->run(); }
+
+// No runtime driver, and not because one is hard to write: this is **not a
+// true escape**. `run` is a *static* member function, so `t->run()` evaluates
+// `t`, discards it, and passes no object; nothing ever dereferences it. The
+// rejection is a precision loss, and it is one that sits permanently outside
+// this oracle -- no driver can demonstrate an escape that does not happen.
+// Tracked by the M3 callables work (#4).
+// NO-DRIVER: not a true escape -- a static member call passes no object

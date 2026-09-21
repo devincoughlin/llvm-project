@@ -38,3 +38,11 @@ void escape(int *p) {
   auto keep = [p] { (void)*p; };
   keep();
 }
+
+// No runtime driver, and not because one is hard to write: this is **not a
+// true escape**. The closure is a local, is invoked in the same frame, and is
+// never stored, copied out or returned, so nothing outlives anything. The
+// rejection is a precision loss, and like callable-use.cpp it sits permanently
+// outside this oracle -- no driver can demonstrate an escape that does not
+// happen. Tracked by the M3 callables work (#4).
+// NO-DRIVER: not a true escape -- the closure is invoked in its own frame

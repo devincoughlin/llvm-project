@@ -59,3 +59,12 @@ int *g;
 void inner(int *q) { g = q; }
 
 void escape(int *p) { inner(p); }
+
+// Runtime half; see store-to-global.cpp for what the driver is for. The
+// dereference reads what `inner` stored, so the report is evidence the escape
+// travels the whole caller-to-callee edge this file is about.
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = g; }
+// DRIVER:   return *k;
+// DRIVER: }

@@ -42,3 +42,14 @@
 void external(int *);
 
 void escape(int *p) { external(p); }
+
+// Runtime half; see store-to-global.cpp for what a driver is for. The driver
+// plays the part of the other translation unit: `external` is declared here
+// and defined there, and what it does with the pointer is exactly what this
+// file cannot see.
+// DRIVER: int *leak;
+// DRIVER: void external(int *q) { leak = q; }
+// DRIVER: int main() {
+// DRIVER:   { int local = 1; escape(&local); }
+// DRIVER:   return *leak;
+// DRIVER: }

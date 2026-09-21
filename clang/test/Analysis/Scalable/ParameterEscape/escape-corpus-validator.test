@@ -1,0 +1,188 @@
+# The escape-corpus validator's own guards, exercised against purpose-built
+# corpora rather than against the real one.
+#
+# `validate_escape_corpus.py` is the only thing in this milestone that checks
+# the analysis against reality, and its other entry point --
+# `check-clang-ssaf-escape-corpus` -- cannot run in a build configured without
+# compiler-rt, which is the configuration this tree is in. Without this file
+# the oracle would have no coverage at all on a fresh clone, and a guard with
+# no case that has been seen to fail is not evidence.
+#
+# Each section below is a corpus the validator must *reject*, except the first.
+
+# This gate can hide the whole file. The invariant to check when reading a lit
+# run is that `llvm-lit --show-unsupported clang/test/Analysis/Scalable` does
+# *not* list this test: if it ever does, the probe in ../lit.local.cfg found no
+# compiler that can link -fsanitize=address, and the oracle has no coverage at
+# all on that machine.
+# REQUIRES: asan-capable-compiler
+
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: split-file %s %t
+
+# =============================================================================
+# 1. A driver that really escapes is accepted.
+# =============================================================================
+
+# RUN: %python %{validator} %{asan-clang} %t/good/Negative \
+# RUN:   | FileCheck %s --check-prefix=GOOD
+# GOOD:      escapes: escaping.cpp
+# GOOD:      not runtime-validated: exempt.cpp: a stated reason
+# GOOD-NEXT: 1 validated, 0 failure(s), 1 not runtime-validated
+
+# =============================================================================
+# 2. A driver whose program does not escape is rejected.
+# =============================================================================
+
+# RUN: not %python %{validator} %{asan-clang} %t/clean/Negative \
+# RUN:   | FileCheck %s --check-prefix=CLEAN
+# CLEAN: FAIL notescaping.cpp: no AddressSanitizer report
+
+# =============================================================================
+# 3. A driver that trips AddressSanitizer for an unrelated reason is rejected.
+# =============================================================================
+
+# This is the case a bare "some report was produced" check cannot see:
+# `escape` does not escape at all, and the driver leaks a different local. The
+# report is a real stack-use-after-scope, on the wrong object.
+# RUN: not %python %{validator} %{asan-clang} %t/unrelated/Negative \
+# RUN:   | FileCheck %s --check-prefix=UNRELATED
+# UNRELATED: FAIL misattributed.cpp: reported stack-use-after-scope but the report does not contain "'local'"
+
+# And the same file passes once the kind is right but the object is not, which
+# is what shows the two checks are independent: here the driver dereferences a
+# freed heap block instead, so the *kind* is what catches it.
+# RUN: not %python %{validator} %{asan-clang} %t/wrongkind/Negative \
+# RUN:   | FileCheck %s --check-prefix=WRONGKIND
+# WRONGKIND: FAIL wrongkind.cpp: reported 'heap-use-after-free', not 'stack-use-after-scope'
+
+# =============================================================================
+# 4. A driver outside Negative/ is rejected.
+# =============================================================================
+
+# A file under Positive/ asserts that its parameter *is* annotated, so an ASan
+# report there would be a false negative in the analysis rather than a pass.
+# RUN: not %python %{validator} %{asan-clang} %t/misplaced/Positive \
+# RUN:   | FileCheck %s --check-prefix=MISPLACED
+# MISPLACED: FAIL misplaced.cpp: DRIVER outside Negative/
+
+# =============================================================================
+# 5. A file with neither a driver nor a stated reason is rejected.
+# =============================================================================
+
+# This is what stops the corpus losing its drivers one at a time: an exemption
+# has to be written in the file that claims it.
+# RUN: not %python %{validator} %{asan-clang} %t/silent/Negative \
+# RUN:   | FileCheck %s --check-prefix=SILENT
+# SILENT: FAIL silent.cpp: neither a // DRIVER: block nor a // NO-DRIVER: reason
+
+# =============================================================================
+# 6. A corpus in which everything is exempt validates nothing, and says so.
+# =============================================================================
+
+# RUN: not %python %{validator} %{asan-clang} %t/allexempt/Negative 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=ALLEXEMPT
+# ALLEXEMPT: error: every file under {{.*}} is exempt; nothing was validated
+
+# =============================================================================
+# 7. A DRIVER-EVIDENCE that every report of its kind contains is rejected.
+# =============================================================================
+
+# The floor: an override has to say something a generic report does not. Both
+# overrides in the real corpus failed this when it was introduced, which is why
+# it exists.
+# RUN: not %python %{validator} %{asan-clang} %t/vacuous/Negative \
+# RUN:   | FileCheck %s --check-prefix=VACUOUS
+# VACUOUS: FAIL vacuous.cpp: DRIVER-EVIDENCE 'is located in stack of thread' appears in the reference report for stack-use-after-scope
+
+# =============================================================================
+# 8. A NO-DRIVER line with no reason is not an exemption.
+# =============================================================================
+
+# RUN: not %python %{validator} %{asan-clang} %t/blankreason/Negative \
+# RUN:   | FileCheck %s --check-prefix=BLANK
+# BLANK: FAIL blankreason.cpp: neither a // DRIVER: block nor a // NO-DRIVER: reason
+
+# =============================================================================
+# 9. A directory with no compilable file at all is an error.
+# =============================================================================
+
+# RUN: mkdir -p %t/nothing
+# RUN: not %python %{validator} %{asan-clang} %t/nothing 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=NOTHING
+# NOTHING: error: no compilable file was found under {{.*}}nothing
+
+#--- good/Negative/escaping.cpp
+int *g;
+void escape(int *p) { g = p; }
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = g; }
+// DRIVER:   return *k;
+// DRIVER: }
+
+#--- good/Negative/exempt.cpp
+void escape(int *p) { asm volatile("" ::"r"(p)); }
+// NO-DRIVER: a stated reason
+
+#--- clean/Negative/notescaping.cpp
+int sink;
+void escape(int *p) { sink = *p; }
+// DRIVER: int main() {
+// DRIVER:   int local = 1;
+// DRIVER:   escape(&local);
+// DRIVER:   return sink - 1;
+// DRIVER: }
+
+#--- unrelated/Negative/misattributed.cpp
+int sink;
+void escape(int *p) { sink = *p; }
+// DRIVER: int *volatile leak;
+// DRIVER: int main() {
+// DRIVER:   int local = 1;
+// DRIVER:   escape(&local);
+// DRIVER:   { int unrelated = 2; leak = &unrelated; }
+// DRIVER:   return *leak;
+// DRIVER: }
+
+#--- wrongkind/Negative/wrongkind.cpp
+int sink;
+void escape(int *p) { sink = *p; }
+// DRIVER: int *volatile leak;
+// DRIVER: int main() {
+// DRIVER:   int local = 1;
+// DRIVER:   escape(&local);
+// DRIVER:   leak = new int(2);
+// DRIVER:   delete leak;
+// DRIVER:   return *leak;
+// DRIVER: }
+
+#--- misplaced/Positive/misplaced.cpp
+int *g;
+void escape(int *p) { g = p; }
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = g; }
+// DRIVER:   return *k;
+// DRIVER: }
+
+#--- vacuous/Negative/vacuous.cpp
+int *g;
+void escape(int *p) { g = p; }
+// DRIVER-EVIDENCE: is located in stack of thread
+// DRIVER: int main() {
+// DRIVER:   int *k;
+// DRIVER:   { int local = 1; escape(&local); k = g; }
+// DRIVER:   return *k;
+// DRIVER: }
+
+#--- blankreason/Negative/blankreason.cpp
+void escape(int *p) { (void)*p; }
+// NO-DRIVER:
+
+#--- silent/Negative/silent.cpp
+void escape(int *p) { (void)*p; }
+
+#--- allexempt/Negative/exempt.cpp
+void escape(int *p) { asm volatile("" ::"r"(p)); }
+// NO-DRIVER: a stated reason
