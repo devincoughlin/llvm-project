@@ -1,5 +1,6 @@
 add_distinct_clang_unittest(ClangScalableAnalysisTests
   Analyses/EntityPointerLevel/EntityPointerLevelTest.cpp
+  Analyses/ParameterEscape/LibraryFunctionKnowledgeTest.cpp
   Analyses/PointerFlow/PointerFlowTest.cpp
   Analyses/PointerFlow/PointerFlowWPATest.cpp
   Analyses/CallGraph/CallGraphExtractorTest.cpp
@@ -59,7 +60,10 @@ add_distinct_clang_unittest(ClangScalableAnalysisTests
   LLVMTestingSupport
 
   LLVM_COMPONENTS
+  Analysis
+  Core
   FrontendOpenMP
   Support
   TargetParser
+  TransformUtils
   )
