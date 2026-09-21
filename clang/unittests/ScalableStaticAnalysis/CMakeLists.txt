@@ -30,6 +30,7 @@ add_distinct_clang_unittest(ClangScalableAnalysisTests
   Serialization/JSONFormatTest/JSONFormatTest.cpp
   Serialization/JSONFormatTest/LUSummaryTest.cpp
   Serialization/JSONFormatTest/ParameterEscapeFormatTest.cpp
+  Serialization/JSONFormatTest/ParameterEscapeResultFormatTest.cpp
   Serialization/JSONFormatTest/SharedLexicalRepresentationFormatTest.cpp
   Serialization/JSONFormatTest/TUSummaryTest.cpp
   SourceTransformation/CppBoundedBuffersTest.cpp
@@ -42,6 +43,7 @@ add_distinct_clang_unittest(ClangScalableAnalysisTests
   TestFixture.cpp
   TUSummaryBuilderTest.cpp
   WholeProgramAnalysis/AnalysisDriverTest.cpp
+  WholeProgramAnalysis/NonEscapingParametersAnalysisTest.cpp
   WholeProgramAnalysis/UnsafeBufferReachableAnalysisTest.cpp
 
   CLANG_LIBS

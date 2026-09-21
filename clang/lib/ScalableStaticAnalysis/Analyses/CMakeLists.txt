@@ -12,6 +12,7 @@ add_clang_library(clangScalableStaticAnalysisAnalyses
   ParameterEscape/EscapeClassifier.cpp
   ParameterEscape/LibraryFunctionKnowledge.cpp
   ParameterEscape/ParameterEscape.cpp
+  ParameterEscape/ParameterEscapeAnalysis.cpp
   ParameterEscape/ParameterEscapeExtractor.cpp
   ParameterEscape/ParameterEscapeFormat.cpp
   PointerFlow/PointerFlow.cpp

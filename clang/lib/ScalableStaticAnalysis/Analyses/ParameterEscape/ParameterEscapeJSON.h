@@ -21,6 +21,14 @@
 
 namespace clang::ssaf {
 
+/// Narrows a JSON integer to a parameter index, rejecting values that would
+/// wrap on conversion. \p Min admits ThisParamIndex where the sentinel is
+/// meaningful and excludes it where it is not; \p Key names the field in the
+/// diagnostic.
+llvm::Expected<int64_t> checkedParamIndex(const llvm::json::Value &V,
+                                          int64_t Raw, int64_t Min, int64_t Max,
+                                          llvm::StringLiteral Key);
+
 llvm::json::Object sourceLocationRecordToJSON(const SourceLocationRecord &R);
 
 llvm::Expected<SourceLocationRecord>
