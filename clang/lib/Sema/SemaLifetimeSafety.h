@@ -92,7 +92,6 @@ inline bool IsLifetimeSafetyEnabled(Sema &S, const Decl *D) {
   if (S.getLangOpts().ObjC)
     return false;
 
-  // TODO: Default this flag to on in the future.
   if (!S.getLangOpts().CPlusPlus && !S.getLangOpts().EnableLifetimeSafetyInC)
     return false;
 
