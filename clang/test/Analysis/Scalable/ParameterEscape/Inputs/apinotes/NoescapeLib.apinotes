@@ -1,0 +1,6 @@
+Name: NoescapeLib
+Functions:
+  - Name: trusted
+    Parameters:
+      - Position: 0
+        NoEscape: true

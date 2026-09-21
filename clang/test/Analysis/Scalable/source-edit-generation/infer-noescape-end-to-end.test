@@ -1,0 +1,156 @@
+// The whole pipeline, end to end, over two translation units sharing a header:
+// extract, link, analyze, transform each TU, merge, apply -- and then four
+// independent checks that the result is right.
+//
+// Nothing else in this suite closes the loop. The transformation tests stop at
+// the generated YAML, and YAML that looks correct is not the same as source
+// that compiles: a wrong offset, a spelling that does not parse, or an
+// attribute placed on the wrong declarator all produce plausible YAML.
+//
+// The four checks, in the order they run:
+//
+//  1. the merged replacement count matches what the tree ends up holding. Both
+//     TUs see shared.h and both propose the same insertion into it, so this is
+//     also what proves the merge deduplicates: four proposals in, three
+//     replacements out, three attributes on disk;
+//  2. both TUs recompile clean under -Werror -Wlifetime-safety-noescape, which
+//     is a *different* analysis reading the attributes this one wrote. It is
+//     the only check here that does not share code with what produced them;
+//  3. the header's rewritten text is what was intended, asserted from up here
+//     rather than from inside the split file -- a CHECK inside a `//---`
+//     section would be split out into the header itself and then rewritten by
+//     the very edit it is checking;
+//  4. a second full run proposes nothing. Idempotency is what makes the
+//     transformation safe to run in a build, and it is the property most
+//     likely to regress silently.
+
+// REQUIRES: clang-apply-replacements
+
+// RUN: rm -rf %t && mkdir -p %t
+// RUN: split-file %s %t
+
+// DEFINE: %{tu} = unset
+// DEFINE: %{dir} = unset
+// DEFINE: %{extract} = %clang -fsyntax-only %t/%{tu}.cpp \
+// DEFINE:   --ssaf-extract-summaries=ParameterEscape \
+// DEFINE:   --ssaf-compilation-unit-id=%{tu} \
+// DEFINE:   --ssaf-tu-summary-file=%{dir}/%{tu}.tu.json
+// DEFINE: %{link} = clang-ssaf-linker %{dir}/a.tu.json %{dir}/b.tu.json \
+// DEFINE:   -o %{dir}/lu.json
+// DEFINE: %{analyze} = clang-ssaf-analyzer %{dir}/lu.json \
+// DEFINE:   -a NonEscapingParametersResult -o %{dir}/wpa.json
+// DEFINE: %{transform} = %clang -fsyntax-only %t/%{tu}.cpp \
+// DEFINE:   --ssaf-source-transformation=infer-noescape \
+// DEFINE:   --ssaf-global-scope-analysis-result=%{dir}/wpa.json \
+// DEFINE:   --ssaf-compilation-unit-id=%{tu} --ssaf-link-unit-id=lu \
+// DEFINE:   --ssaf-src-edit-file=%{dir}/%{tu}.edits.yaml \
+// DEFINE:   --ssaf-transformation-report-file=%{dir}/%{tu}.report.sarif
+// DEFINE: %{merge} = clang-ssaf-src-edit-merge \
+// DEFINE:   %{dir}/a.edits.yaml %{dir}/b.edits.yaml \
+// DEFINE:   -o %{dir}/apply/merged.yaml
+
+// =============================================================================
+// Run 1: the edits are produced, merged and applied.
+// =============================================================================
+
+// Every stage writes under %t/run1, and the apply directory holds nothing but
+// the merged YAML -- clang-apply-replacements reads every file in the
+// directory it is given, so the per-TU YAMLs must stay outside it or they
+// would be applied a second time on top of the merge.
+// RUN: mkdir -p %t/run1/apply
+
+// REDEFINE: %{dir} = %t/run1
+// REDEFINE: %{tu} = a
+// RUN: %{extract}
+// REDEFINE: %{tu} = b
+// RUN: %{extract}
+// RUN: %{link}
+// RUN: %{analyze}
+// REDEFINE: %{tu} = a
+// RUN: %{transform}
+// REDEFINE: %{tu} = b
+// RUN: %{transform}
+
+// Four proposals across the two TUs, two of them the same insertion into
+// shared.h.
+// RUN: grep 'ReplacementText:' %t/run1/a.edits.yaml %t/run1/b.edits.yaml \
+// RUN:   | count 4
+
+// RUN: %{merge}
+
+// Three after the merge: one per declaration in the tree, shared.h counted
+// once.
+// RUN: grep 'ReplacementText:' %t/run1/apply/merged.yaml | count 3
+
+// RUN: clang-apply-replacements %t/run1/apply
+
+// Check 1: three replacements merged, three attributes on disk.
+// RUN: grep '__attribute__((noescape))' %t/shared.h %t/a.cpp %t/b.cpp \
+// RUN:   | count 3
+
+// Check 2: the independent verifier accepts what was written. -Werror turns
+// its warning into a failure, and the warning is off by default, so naming the
+// group is what makes this check exist at all.
+// RUN: %clang -fsyntax-only -Werror -Wlifetime-safety-noescape %t/a.cpp
+// RUN: %clang -fsyntax-only -Werror -Wlifetime-safety-noescape %t/b.cpp
+
+// Check 3: the rewritten text, asserted against literals. These directives sit
+// outside every `//---` section on purpose.
+// RUN: FileCheck %s --check-prefix=HEADER --input-file=%t/shared.h \
+// RUN:   --match-full-lines
+// HEADER: void takes(__attribute__((noescape)) int *p, int n);
+
+// RUN: FileCheck %s --check-prefix=DEFN --input-file=%t/a.cpp \
+// RUN:   --match-full-lines
+// DEFN: void takes(__attribute__((noescape)) int *p, int n) {
+
+// `caller`'s parameter is annotated only because `takes` was proven clean in
+// the *other* TU, so this line is the cross-TU half of the result.
+// RUN: FileCheck %s --check-prefix=CALLER --input-file=%t/b.cpp \
+// RUN:   --match-full-lines
+// CALLER: void caller(__attribute__((noescape)) int *q) { takes(q, 1); }
+
+// =============================================================================
+// Run 2: the same pipeline over the rewritten tree proposes nothing.
+// =============================================================================
+
+// RUN: mkdir -p %t/run2/apply
+
+// REDEFINE: %{dir} = %t/run2
+// REDEFINE: %{tu} = a
+// RUN: %{extract}
+// REDEFINE: %{tu} = b
+// RUN: %{extract}
+// RUN: %{link}
+// RUN: %{analyze}
+// REDEFINE: %{tu} = a
+// RUN: %{transform}
+// REDEFINE: %{tu} = b
+// RUN: %{transform}
+// RUN: %{merge}
+
+// Check 4: no edit anywhere in the second run. This is written as positive
+// evidence -- three files each carrying an explicitly empty replacement list
+// -- rather than as an absence. `grep | count 0` cannot express it: grep exits
+// 1 when it matches nothing, which fails the pipeline, and `not grep` would
+// also pass if the files were missing entirely.
+// RUN: grep -E 'Replacements: +\[\]' %t/run2/a.edits.yaml \
+// RUN:   %t/run2/b.edits.yaml %t/run2/apply/merged.yaml | count 3
+
+// And the second run is not vacuous: it still has the same three candidates to
+// consider, it simply finds them already annotated.
+// RUN: grep '"params":' %t/run2/wpa.json | count 2
+
+//--- shared.h
+void takes(int *p, int n);
+
+//--- a.cpp
+#include "shared.h"
+void takes(int *p, int n) {
+  for (int i = 0; i < n; ++i)
+    (void)p[i];
+}
+
+//--- b.cpp
+#include "shared.h"
+void caller(int *q) { takes(q, 1); }

@@ -133,6 +133,19 @@ if(CLANG_ENABLE_STATIC_ANALYZER)
     )
 endif()
 
+# clang-apply-replacements lives in clang-tools-extra, so it only exists when
+# that project is enabled. The SSAF source-edit tests gate on the
+# `clang-apply-replacements` lit feature, which
+# Analysis/Scalable/source-edit-generation/lit.local.cfg adds by looking for
+# the binary in the tools directory -- so without this dependency a fresh
+# `ninja check-clang` silently runs those tests as UNSUPPORTED and reports
+# coverage it does not have.
+if(TARGET clang-apply-replacements)
+  list(APPEND CLANG_TEST_DEPS
+    clang-apply-replacements
+    )
+endif()
+
 if(CLANG_BUILD_EXAMPLES AND CLANG_PLUGIN_SUPPORT)
   list(APPEND CLANG_TEST_DEPS
     Attribute

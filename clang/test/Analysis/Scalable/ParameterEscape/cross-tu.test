@@ -1,0 +1,191 @@
+// The cross-TU claim: a callee's definition in one translation unit decides
+// the annotation of a caller's parameter in another.
+//
+// Every escape decision in a.cpp turns on a declaration with no body in a.cpp.
+// What separates the five verdicts is only what the *link unit* knows about
+// that declaration, so this is the one property no single-TU test can show.
+//
+// The two extractions override %{pe-extract}'s compilation-unit id -- the
+// linker refuses two TUs in the same CompilationUnit namespace, and a Joined
+// option's last occurrence wins.
+
+// RUN: rm -rf %t && mkdir -p %t
+// RUN: split-file %s %t
+
+// RUN: %{pe-extract} --ssaf-compilation-unit-id=a %t/a.cpp \
+// RUN:   --ssaf-tu-summary-file=%t/a.json
+// RUN: %{pe-extract} --ssaf-compilation-unit-id=b %t/b.cpp \
+// RUN:   --ssaf-tu-summary-file=%t/b.json
+// RUN: %{pe-link} %t/a.json %t/b.json -o %t/lu.json
+// RUN: %{pe-analyze} %t/lu.json -o %t/wpa.json
+
+// `trusted` is absent from the link unit entirely: a parameter already spelled
+// `noescape` records no edge, which is the mechanism by which the declaration
+// is trusted. That absence is asserted with --implicit-check-not, which is
+// position-independent. A CHECK-NOT would not do: it guards only the region
+// between its neighbours, and `trusted` sorts *before* every id the checks
+// below name, so the directive would sit past the thing it names and pass
+// whatever the input said. Measured: splicing a `trusted` entry into a real
+// wpa.json at its sorted position fails the `"id": 5,` check instead.
+// RUN: FileCheck %s --input-file=%t/wpa.json \
+// RUN:   --implicit-check-not='"usr": "c:@F@trusted#*I#"'
+
+// The link unit's id assignment is deterministic (measured over repeated runs)
+// but is not USR order -- the table is only *listed* in USR order, and in
+// source-edit-generation/infer-noescape-mixed-language.test the ids run the
+// other way. So the ids here were read off rather than predicted, and each is
+// bound to a USR below so that every "@" that follows names a function rather
+// than a number.
+// CHECK:      "id": 0,
+// CHECK:        "usr": "c:@F@clean_callee#*I#"
+// CHECK:      "id": 1,
+// CHECK:        "usr": "c:@F@dirty_callee#*I#"
+// CHECK:      "id": 2,
+// CHECK:        "usr": "c:@F@never_defined#*I#"
+// CHECK:      "id": 3,
+// CHECK:        "usr": "c:@F@recurses#*I#I#"
+// CHECK:      "id": 4,
+// CHECK:        "usr": "c:@F@via_clean#*I#"
+// CHECK:      "id": 5,
+// CHECK:        "usr": "c:@F@via_dirty#*I#"
+// CHECK:      "id": 6,
+// CHECK:        "usr": "c:@F@via_missing#*I#"
+// CHECK:      "id": 7,
+// CHECK:        "usr": "c:@F@via_trusted#*I#"
+
+// Annotated: the callee defined clean in b.cpp (0), the self-recursive cycle
+// (3), the caller whose callee b.cpp defines clean (4), and the caller of the
+// externally declared `noescape` (7). The closing `]` pins the count at four.
+// CHECK:      "non_escaping": [
+// CHECK-NEXT:   {
+// CHECK-NEXT:     "function": {
+// CHECK-NEXT:       "@": 0
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "params": [
+// CHECK-NEXT:       0
+// CHECK-NEXT:     ]
+// CHECK-NEXT:   },
+// CHECK-NEXT:   {
+// CHECK-NEXT:     "function": {
+// CHECK-NEXT:       "@": 3
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "params": [
+// CHECK-NEXT:       0
+// CHECK-NEXT:     ]
+// CHECK-NEXT:   },
+// CHECK-NEXT:   {
+// CHECK-NEXT:     "function": {
+// CHECK-NEXT:       "@": 4
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "params": [
+// CHECK-NEXT:       0
+// CHECK-NEXT:     ]
+// CHECK-NEXT:   },
+// CHECK-NEXT:   {
+// CHECK-NEXT:     "function": {
+// CHECK-NEXT:       "@": 7
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "params": [
+// CHECK-NEXT:       0
+// CHECK-NEXT:     ]
+// CHECK-NEXT:   }
+// CHECK-NEXT: ],
+
+// Rejected: b.cpp's own escaping definition (1), the caller that reaches it
+// across the TU boundary (5, blamed on 1), and the caller of the declaration
+// no TU defines (6, blamed on 2 as UnanalyzedCallee). The two callers differ
+// only in whether the link unit holds a fact for the callee, which is the
+// whole of the cross-TU claim.
+// CHECK-NEXT: "rejected": [
+// CHECK-NEXT:   {
+// CHECK-NEXT:     "detail": "g",
+// CHECK-NEXT:     "location": {
+// CHECK-NEXT:       "column": 33,
+// CHECK-NEXT:       "file": "{{.*}}b.cpp",
+// CHECK-NEXT:       "line": 5
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "node": {
+// CHECK-NEXT:       "function": {
+// CHECK-NEXT:         "@": 1
+// CHECK-NEXT:       },
+// CHECK-NEXT:       "param": 0
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "reason": "StoreToGlobal"
+// CHECK-NEXT:   },
+// CHECK-NEXT:   {
+// CHECK-NEXT:     "blame": {
+// CHECK-NEXT:       "function": {
+// CHECK-NEXT:         "@": 1
+// CHECK-NEXT:       },
+// CHECK-NEXT:       "param": 0
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "detail": "",
+// CHECK-NEXT:     "location": {
+// CHECK-NEXT:       "column": 39,
+// CHECK-NEXT:       "file": "{{.*}}a.cpp",
+// CHECK-NEXT:       "line": 16
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "node": {
+// CHECK-NEXT:       "function": {
+// CHECK-NEXT:         "@": 5
+// CHECK-NEXT:       },
+// CHECK-NEXT:       "param": 0
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "reason": "EscapesViaCallee"
+// CHECK-NEXT:   },
+// CHECK-NEXT:   {
+// CHECK-NEXT:     "blame": {
+// CHECK-NEXT:       "function": {
+// CHECK-NEXT:         "@": 2
+// CHECK-NEXT:       },
+// CHECK-NEXT:       "param": 0
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "detail": "",
+// CHECK-NEXT:     "location": {
+// CHECK-NEXT:       "column": 42,
+// CHECK-NEXT:       "file": "{{.*}}a.cpp",
+// CHECK-NEXT:       "line": 17
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "node": {
+// CHECK-NEXT:       "function": {
+// CHECK-NEXT:         "@": 6
+// CHECK-NEXT:       },
+// CHECK-NEXT:       "param": 0
+// CHECK-NEXT:     },
+// CHECK-NEXT:     "reason": "UnanalyzedCallee"
+// CHECK-NEXT:   }
+// CHECK-NEXT: ]
+
+//--- a.cpp
+
+// Defined in b.cpp and clean: the edge resolves and carries nothing.
+void clean_callee(int *q);
+
+// Defined in b.cpp and dirty: the edge resolves and carries an escape.
+void dirty_callee(int *q);
+
+// Defined nowhere in the link unit.
+void never_defined(int *q);
+
+// Defined nowhere either, but the declaration already promises what the
+// analysis would have had to prove.
+void trusted(__attribute__((noescape)) int *q);
+
+void via_clean(int *p) { clean_callee(p); }
+void via_dirty(int *p) { dirty_callee(p); }
+void via_missing(int *p) { never_defined(p); }
+void via_trusted(int *p) { trusted(p); }
+
+// A cycle with no sink on it. The fixpoint must reach the least solution
+// rather than blaming the back edge on an unresolved callee.
+void recurses(int *p, int n) {
+  if (n > 0)
+    recurses(p, n - 1);
+}
+
+//--- b.cpp
+
+int *g;
+
+void clean_callee(int *q) { (void)*q; }
+void dirty_callee(int *q) { g = q; }

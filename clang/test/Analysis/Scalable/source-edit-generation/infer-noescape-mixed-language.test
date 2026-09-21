@@ -1,0 +1,131 @@
+// A header shared by a C translation unit and a C++ one receives exactly one
+// merged insertion, and both languages recompile afterwards.
+//
+// The header wraps its declaration in `extern "C"`, which is what makes the
+// two TUs agree on the entity: measured, `takes` has the USR `c:@F@takes` from
+// both a.c and b.cpp, so the link unit holds one node and both TUs propose the
+// same insertion into shared.h. Without the `extern "C"` the C++ TU would see
+// `c:@F@takes#*I#i#` instead, the link unit would hold two unrelated nodes, and
+// the header would be edited by one TU rather than agreed on by two -- which
+// would still leave one insertion in the merged output and would therefore
+// pass this test for the wrong reason. The four-to-three count below is what
+// distinguishes the two.
+//
+// The tool gate below is what makes the recompile check possible, and the
+// recompile is the point of the file.
+
+// REQUIRES: clang-apply-replacements
+
+// RUN: rm -rf %t && mkdir -p %t %t/apply
+// RUN: split-file %s %t
+
+// DEFINE: %{tu} = unset
+// DEFINE: %{extract} = %clang -fsyntax-only %t/%{tu} \
+// DEFINE:   --ssaf-extract-summaries=ParameterEscape \
+// DEFINE:   --ssaf-compilation-unit-id=%{tu} \
+// DEFINE:   --ssaf-tu-summary-file=%t/%{tu}.tu.json
+// DEFINE: %{transform} = %clang -fsyntax-only %t/%{tu} \
+// DEFINE:   --ssaf-source-transformation=infer-noescape \
+// DEFINE:   --ssaf-global-scope-analysis-result=%t/wpa.json \
+// DEFINE:   --ssaf-compilation-unit-id=%{tu} --ssaf-link-unit-id=lu \
+// DEFINE:   --ssaf-src-edit-file=%t/%{tu}.edits.yaml \
+// DEFINE:   --ssaf-transformation-report-file=%t/%{tu}.report.sarif
+
+// REDEFINE: %{tu} = a.c
+// RUN: %{extract}
+// REDEFINE: %{tu} = b.cpp
+// RUN: %{extract}
+
+// RUN: clang-ssaf-linker %t/a.c.tu.json %t/b.cpp.tu.json -o %t/lu.json
+// RUN: clang-ssaf-analyzer %t/lu.json -a NonEscapingParametersResult \
+// RUN:   -o %t/wpa.json
+
+// One entity for `takes`, reached from both languages, and one for `caller`.
+// Both are annotated and nothing is rejected -- `caller` only because the C TU
+// supplied the definition of `takes`. In `non_escaping` the entries are in id
+// order, so entity 0 (`takes`) comes first.
+// RUN: FileCheck %s --check-prefix=WPA --input-file=%t/wpa.json
+// The id table is *listed* in USR order, but the ids themselves are not
+// assigned in that order -- here `takes` is 0 and `caller` is 1, the reverse
+// of the listing. The assignment is deterministic (measured over repeated
+// runs), which is why it can be asserted; it is just not USR order, so it has
+// to be read off rather than predicted.
+// WPA:      "id": 1,
+// WPA:        "usr": "c:@F@caller#*I#"
+// WPA:      "id": 0,
+// WPA:        "usr": "c:@F@takes"
+// WPA:      "non_escaping": [
+// WPA-NEXT:   {
+// WPA-NEXT:     "function": {
+// WPA-NEXT:       "@": 0
+// WPA-NEXT:     },
+// WPA-NEXT:     "params": [
+// WPA-NEXT:       0
+// WPA-NEXT:     ]
+// WPA-NEXT:   },
+// WPA-NEXT:   {
+// WPA-NEXT:     "function": {
+// WPA-NEXT:       "@": 1
+// WPA-NEXT:     },
+// WPA-NEXT:     "params": [
+// WPA-NEXT:       0
+// WPA-NEXT:     ]
+// WPA-NEXT:   }
+// WPA-NEXT: ],
+// WPA-NEXT: "rejected": []
+
+// REDEFINE: %{tu} = a.c
+// RUN: %{transform}
+// REDEFINE: %{tu} = b.cpp
+// RUN: %{transform}
+
+// Four proposals: each TU edits shared.h and its own file. That both TUs
+// propose the header edit is the mixed-language claim; if only one did, this
+// would be 3.
+// RUN: grep 'ReplacementText:' %t/a.c.edits.yaml %t/b.cpp.edits.yaml | count 4
+// RUN: grep 'shared.h' %t/a.c.edits.yaml %t/b.cpp.edits.yaml | count 2
+
+// RUN: clang-ssaf-src-edit-merge %t/a.c.edits.yaml %t/b.cpp.edits.yaml \
+// RUN:   -o %t/apply/merged.yaml
+
+// Three after merging, and shared.h exactly once.
+// RUN: grep 'ReplacementText:' %t/apply/merged.yaml | count 3
+// RUN: grep 'shared.h' %t/apply/merged.yaml | count 1
+
+// RUN: clang-apply-replacements %t/apply
+
+// The header is rewritten once, in the one place it declares the parameter.
+// These directives are outside every `//---` section: a CHECK written inside
+// one would be split into the header and then rewritten by the edit under
+// test.
+// RUN: FileCheck %s --check-prefix=HEADER --input-file=%t/shared.h \
+// RUN:   --match-full-lines
+// HEADER: void takes(__attribute__((noescape)) int *p, int n);
+// RUN: grep '__attribute__((noescape))' %t/shared.h | count 1
+
+// Both languages accept the rewritten header, and the independent verifier
+// finds nothing to complain about in either.
+// RUN: %clang -fsyntax-only -Werror -Wlifetime-safety-noescape %t/a.c
+// RUN: %clang -fsyntax-only -Werror -Wlifetime-safety-noescape %t/b.cpp
+
+//--- shared.h
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void takes(int *p, int n);
+
+#ifdef __cplusplus
+}
+#endif
+
+//--- a.c
+#include "shared.h"
+void takes(int *p, int n) {
+  for (int i = 0; i < n; ++i)
+    (void)p[i];
+}
+
+//--- b.cpp
+#include "shared.h"
+void caller(int *q) { takes(q, 1); }
