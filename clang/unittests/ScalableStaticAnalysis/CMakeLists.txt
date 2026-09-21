@@ -35,6 +35,7 @@ add_distinct_clang_unittest(ClangScalableAnalysisTests
   Serialization/JSONFormatTest/TUSummaryTest.cpp
   SourceTransformation/CppBoundedBuffersTest.cpp
   SourceTransformation/EmitterTest.cpp
+  SourceTransformation/InferNoescapeTest.cpp
   SourceTransformation/RegistryTest.cpp
   SourceTransformation/SARIFFormatTest.cpp
   SourceTransformation/YAMLFormatTest.cpp

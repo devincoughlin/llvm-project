@@ -17,6 +17,8 @@
 // HELP-NEXT:  --ssaf-list-formats     Display the list of available SSAF serialization formats
 // HELP-NEXT:  --ssaf-no-extract-from-system-headers
 // HELP-NEXT:    Skip declarations in system headers during SSAF summary extraction
+// HELP-NEXT:  --ssaf-noescape-spelling=<text>
+// HELP-NEXT:    Attribute spelling inserted by the 'infer-noescape' SSAF source transformation. Defaults to '__attribute__((noescape))'. Pass the same value for every translation unit of a link unit.
 // HELP-NEXT:  --ssaf-source-transformation=<name>
 // HELP-NEXT:    Name of the SSAF source transformation to run. Exactly one transformation per invocation.
 // HELP-NEXT:  --ssaf-src-edit-file=<path>

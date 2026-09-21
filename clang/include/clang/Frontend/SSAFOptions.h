@@ -56,6 +56,14 @@ public:
   /// Controlled by: --ssaf-transformation-report-file
   std::string TransformationReportFile;
 
+  /// Attribute spelling inserted by the 'infer-noescape' source
+  /// transformation. Empty means `__attribute__((noescape))`. Must be the
+  /// same for every translation unit of a link unit: the merge tool
+  /// deduplicates byte-identical insertions but cannot reconcile differing
+  /// spellings at one site.
+  /// Controlled by: --ssaf-noescape-spelling
+  std::string NoescapeSpelling;
+
   /// Show the list of available SSAF summary extractors and exit.
   /// Controlled by: --ssaf-list-extractors
   LLVM_PREFERRED_TYPE(bool)
