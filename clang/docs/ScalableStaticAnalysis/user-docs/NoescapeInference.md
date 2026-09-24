@@ -123,7 +123,12 @@ no edits, which is what makes it safe to run inside a build.
 
 ## What is trusted
 
-Nothing outside the link unit is believed except two things:
+The fixpoint proves what it can and believes exactly two things it has not
+proved. Neither is a rule about what lies *outside* the link unit: the first
+is believed wherever it is written, whether the callee's body is in the link
+unit or not, and the second applies to a callee with no body *in the
+translation unit holding the call* — a definition elsewhere in the link unit
+does not displace it.
 
 - **`noescape` written by a human**, in source or through API Notes, on a
   declaration of a callee parameter. This is a *claim*, and it is believed
@@ -141,12 +146,63 @@ Nothing outside the link unit is believed except two things:
   rather than the analyzed body. Delete the attribute and `caller` becomes
   `EscapesViaCallee`.
 
-  So a wrong `noescape` anywhere in your headers can produce a wrong
-  annotation somewhere else. Before trusting existing annotations, audit them
-  with `-Wlifetime-safety-noescape`, an independent analysis that checks
-  bodies against the attributes on them. *Auditing existing annotations*
-  below gives the command — which needs an extra flag on C — and the control
-  without which a clean audit is not evidence.
+  That is the rule rather than an accident of it, and it was kept over the
+  alternative
+  ([#44](https://github.com/devincoughlin/llvm-project/issues/44)). The
+  attribute is trusted in the first place because a declaration's body may be
+  absent from the link unit — a system library, a header over a binary — and
+  believing what a human wrote on the declaration is then the only way to get
+  an answer at all. The alternative was to narrow that trust: prefer the
+  analyzed verdict whenever the body *is* present, and believe the attribute
+  only when it is not. It was considered and declined. The analysis is
+  conservative by construction — anything it cannot model is an escape — so
+  wherever it is imprecise, the analyzed verdict would override a correct
+  human annotation and lose exactly the precision the annotation was written
+  to supply. The trust is therefore uniform: a written `noescape` outranks the
+  analysis's own verdict on the same parameter, even one it has already
+  computed.
+
+  The cost of that choice is accepted, and it is specific. The pipeline is
+  otherwise conservative in one direction only, so that a defect is a
+  *missing* annotation. This is one of two places a defect is an **inserted**
+  one, and the one a written attribute controls: a wrong or stale `noescape`
+  anywhere in your headers can produce a wrong annotation somewhere else,
+  whose proof rested on the claim. Nothing in the pipeline relates the two
+  facts it holds. Measured: with the attribute present, the
+  per-translation-unit summary records no flow from `caller`'s parameter to
+  `liar` at all — the call site's trust discharges the edge at extraction —
+  so the whole-program step never sees a contradiction to report, and the run
+  above lists `liar`'s rejection and `caller`'s annotation side by side
+  without comment.
+
+  The other place is the table of C library functions below. Its rows cannot
+  be wrong — a unit test proves each against LLVM — but its premise, that the
+  definition which links is the C library's, is checked by nothing, and the
+  audit cannot reach it: a program with no written `noescape` gives
+  `-Wlifetime-safety-noescape` nothing to check. Measured: a `.c` file
+  defining a `strlen` that stores its argument to a global, linked with a
+  caller that reaches it through a bare declaration, annotates the caller's
+  parameter with an empty `rejected` list, and step 4 writes the attribute.
+  The definition is never summarised at all — a function clang models as a
+  builtin gets no entity name (`ASTEntityMapping.cpp`) — so the link unit
+  never holds the contradicting evidence. The same body named `mylen` is
+  `StoreToGlobal`, and its caller `EscapesViaCallee`. The premise is the one
+  the optimizer already makes of the same declaration, so a program that
+  breaks it is already miscompiled; that makes the case defensible rather
+  than absent, and it is open as
+  [#57](https://github.com/devincoughlin/llvm-project/issues/57).
+
+  For the written attribute, that makes the audit a precondition rather than
+  a suggestion: it is what makes this choice safe, not something attached to
+  it. Before trusting existing annotations — before running the inference
+  over a tree that has any — audit them with `-Wlifetime-safety-noescape`, an
+  independent analysis that checks bodies against the attributes on them, and
+  fix what it finds. The inference's output is then only as trustworthy as
+  that audit was, and the audit checks only what it examined: an annotation
+  on a declaration whose body it never reached is believed on the writer's
+  word, with nothing behind it. *Auditing existing annotations* below gives
+  the command — which needs an extra flag on C — and the control without
+  which a clean audit is not evidence.
 
   **In C the audit cannot reach the annotations this rule is about.** The
   attribute is believed when a human writes it on a *declaration*, and a
