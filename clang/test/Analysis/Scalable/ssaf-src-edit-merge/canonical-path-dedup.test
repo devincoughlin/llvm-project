@@ -1,0 +1,69 @@
+# The same header reached through different spellings from different TUs
+# collapses to ONE replacement in the merged output, keyed by the file's
+# canonical absolute path rather than by the FilePath string.
+#
+# This is the defect in issue #48: a.c includes "inc/shared.h" and records
+# './inc/shared.h'; sub/b.c reaches the same header via -I/abs/inc and records
+# '/abs/inc/shared.h'. Deduplicating by string kept both, and
+# clang-apply-replacements applied both to one file, producing
+# `__attribute__((noescape)) __attribute__((noescape))`. (The extractor's
+# real edits are zero-length insertions; zero-length-insert-canonical-path.test
+# has that shape with the issue's exact two spellings. This test uses a
+# non-zero length so the edits also pass through the conflict-cluster
+# machinery, which zero-length insertions bypass.)
+#
+# Three spellings of one file, each targeting a different resolution step:
+#   a.yaml  absolute path                     (already canonical)
+#   b.yaml  relative path with a `..` segment (needs cwd + normalization)
+#   c.yaml  symlink                           (needs real_path, not merely
+#                                              make_absolute)
+# All three carry the byte-identical edit, so the expected outcome is a
+# silent collapse — the same treatment the pre-dedup pass already gives
+# byte-identical replacements whose FilePath strings happen to agree.
+#
+# Each input also names the same main source file, main.c, by the matching
+# three spellings; MainSourceFile is canonicalized before the inputs are
+# compared, so they agree and the merged document carries its absolute path
+# rather than the '' that disagreeing inputs produce.
+
+# RUN: rm -rf %t.dir
+# RUN: mkdir -p %t.dir/sub
+# RUN: printf '%%80s' '' > %t.dir/foo.cpp
+# RUN: printf '%%80s' '' > %t.dir/main.c
+# RUN: ln -s foo.cpp %t.dir/link.cpp
+# RUN: ln -s main.c %t.dir/link-main.c
+
+# RUN: cp %S/Inputs/single-replacement.tpl.yaml %t.dir/a.yaml
+# RUN: cp %S/Inputs/single-replacement.tpl.yaml %t.dir/b.yaml
+# RUN: cp %S/Inputs/single-replacement.tpl.yaml %t.dir/c.yaml
+# (One -e per sed: under lit, BSD sed binds -i's suffix to the next word.)
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  '%/t.dir/main.c'|; s|@FOO@|%/t.dir/foo.cpp|g" %t.dir/a.yaml
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'sub/../main.c'|; s|@FOO@|sub/../foo.cpp|g" %t.dir/b.yaml
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'link-main.c'|; s|@FOO@|link.cpp|g" %t.dir/c.yaml
+
+# The relative spellings resolve against the merger's working directory.
+# RUN: cd %t.dir && clang-ssaf-src-edit-merge -o %t.dir/merged.yaml \
+# RUN:     %t.dir/a.yaml %t.dir/b.yaml %t.dir/c.yaml 2> %t.dir/stderr.txt
+
+# Every path in the document is asserted as a spelled-out literal — not
+# matched with a wildcard — because a wildcard could not tell link.cpp from
+# foo.cpp, or the `..` spelling from the resolved one, and so could not see
+# which spelling won or whether canonicalization ran at all. The literals
+# assume %t contains no symlinked component (real_path would resolve one and
+# the literal would not match). The pre-existing tests in this suite do not
+# make that assumption — they match only a basename suffix, or `{{.*}}` —
+# so the canonical-path tests added for issue #48 are the ones that do. On a
+# build tree reached through a symlink, they fail together for that reason.
+# RUN: FileCheck --input-file=%t.dir/merged.yaml -DDIR=%/t.dir %s
+# CHECK:      MainSourceFile:  '[[DIR]]/main.c'
+# CHECK-NEXT: Replacements:
+# CHECK-NEXT:   - FilePath:        '[[DIR]]/foo.cpp'
+# CHECK-NEXT:     Offset:          10
+# CHECK-NEXT:     Length:          3
+# CHECK-NEXT:     ReplacementText: X
+# CHECK-NEXT: ...
+# CHECK-NOT: FilePath:
+
+# Silent: no conflict line, no missing-file line.
+# RUN: FileCheck --input-file=%t.dir/stderr.txt --allow-empty --check-prefix=NOSTDERR %s
+# NOSTDERR-NOT: {{conflict:|does not exist}}

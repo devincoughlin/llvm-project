@@ -1,0 +1,57 @@
+# Two DIFFERENT edits at the same offset of one file, reached through two
+# spellings of that file's path, are a conflict — the same conflict they
+# would be if both inputs had spelled the path identically.
+#
+# Before paths were canonicalized (issue #48) these two replacements landed
+# in different per-file buckets, were never compared, and BOTH survived into
+# the merged output for clang-apply-replacements to fight over. Now they
+# cluster: drop-all removes both, the stderr summary names the canonical
+# path, and the SARIF report carries the canonical file:// URI with one
+# relatedLocation per dropped candidate.
+
+# RUN: rm -rf %t.dir
+# RUN: mkdir -p %t.dir/sub
+# RUN: printf '%%80s' '' > %t.dir/foo.cpp
+# RUN: printf '%%80s' '' > %t.dir/a.c
+# RUN: printf '%%80s' '' > %t.dir/sub/b.c
+
+# RUN: cp %S/Inputs/single-replacement.tpl.yaml %t.dir/a.yaml
+# RUN: cp %S/Inputs/conflict-text-y.tpl.yaml %t.dir/b.yaml
+# (One -e per sed: under lit, BSD sed binds -i's suffix to the next word.)
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'a.c'|; s|@FOO@|%/t.dir/foo.cpp|g" %t.dir/a.yaml
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'sub/b.c'|; s|@FOO@|sub/../foo.cpp|g" %t.dir/b.yaml
+
+# RUN: cd %t.dir && clang-ssaf-src-edit-merge -o %t.dir/merged.yaml \
+# RUN:     --sarif-conflicts-out=%t.dir/conflicts.sarif \
+# RUN:     %t.dir/a.yaml %t.dir/b.yaml 2> %t.dir/stderr.txt
+
+# Drop-all: neither candidate survives. The inputs name different main
+# source files, so MainSourceFile is ''.
+# RUN: FileCheck --input-file=%t.dir/merged.yaml --check-prefix=MERGED %s
+# MERGED:      MainSourceFile:  ''
+# MERGED-NEXT: Replacements:    []
+# MERGED-NEXT: ...
+# MERGED-NOT: ReplacementText:
+
+# One cluster of two, reported against the canonical absolute path (a
+# literal, assuming a symlink-free %t; see canonical-path-dedup.test).
+# The CONFLICT-NOT is a cheap regression guard against a second cluster
+# line; no weakening of the canonicalization makes it fire.
+# RUN: FileCheck --input-file=%t.dir/stderr.txt -DDIR=%/t.dir --check-prefix=CONFLICT %s
+# CONFLICT: conflict: skipped 2 overlapping replacement(s) at [[DIR]]/foo.cpp:10
+# CONFLICT-NOT: conflict:
+
+# The SARIF URI is the canonical path too, and there is one relatedLocation
+# per dropped candidate (sorted by (length, text): X before Y).
+# RUN: FileCheck --input-file=%t.dir/conflicts.sarif -DDIR=%/t.dir --check-prefix=SARIF %s
+# SARIF:      "results": [
+# SARIF:        "uri": "file://[[DIR]]/foo.cpp"
+# SARIF:        "text": "2 overlapping replacement(s) at file://[[DIR]]/foo.cpp byte 10 were dropped; resolve manually."
+# SARIF:        "relatedLocations": [
+# SARIF:          "id": 1
+# SARIF:          "text": "candidate edit: \"X\""
+# SARIF:          "uri": "file://[[DIR]]/foo.cpp"
+# SARIF:          "id": 2
+# SARIF:          "text": "candidate edit: \"Y\""
+# SARIF:          "uri": "file://[[DIR]]/foo.cpp"
+# SARIF:        "ruleId": "clang-reforge-replacement-conflict"

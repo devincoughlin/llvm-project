@@ -23,6 +23,24 @@
 // dropped cluster, and the tool still exits 0. Any input file that does not
 // exist on disk is excluded entirely from the merged output.
 //
+// Every path in every input — each Replacement's FilePath and each TU's
+// MainSourceFile — is canonicalized to an absolute path (symlinks resolved)
+// as soon as its input is read, before anything compares two of them.
+// Per-TU YAML records paths as the compiler spelled them, so two TUs that
+// reach one shared header through different spellings — a quoted relative
+// include in one, an -I search path in the other — would otherwise land in
+// different per-file buckets, never be deduplicated or compared, and both be
+// applied to the same file. The merged YAML therefore carries only absolute
+// paths and is meaningful from any working directory.
+//
+// Canonicalization may rename a path; it never creates existence. Whether a
+// Replacement's file exists is decided on the spelling the input gave, before
+// that spelling is replaced, so a spelling the base tool refused — '',
+// 'foo.cpp/', 'foo.cpp/.' — is still refused even though real_path or
+// make_absolute would resolve it to something that does exist. The canonical
+// spelling is the key; the raw spelling is what a missing-file diagnostic
+// names.
+//
 //===----------------------------------------------------------------------===//
 
 #include "clang/Basic/Version.h"
@@ -142,7 +160,9 @@ struct MergedReplacements {
 /// Compute the shared MainSourceFile across inputs.
 ///
 /// Per spec: if every input declares the same MainSourceFile, use that;
-/// otherwise use the empty string.
+/// otherwise use the empty string. The comparison is on the raw strings, so
+/// it relies on the caller having canonicalized each TU's MainSourceFile
+/// first; two spellings of one file then agree instead of collapsing to ''.
 std::string computeMainSourceFile(
     const std::vector<clang::tooling::TranslationUnitReplacements> &TUs) {
   if (TUs.empty())
@@ -239,26 +259,64 @@ void emitConflictClusterLines(
   }
 }
 
-/// Canonicalize a Replacement's `FilePath` into an absolute `file://` URI.
+/// Canonicalize a path — a Replacement's `FilePath` or a TU's
+/// `MainSourceFile` — to one absolute spelling, so that every path naming
+/// the same file compares equal as a string.
 ///
 /// Fallback chain:
-///   1. `llvm::sys::fs::real_path` — resolves symlinks and yields an
-///      absolute path. Only succeeds if the file exists on disk.
+///   1. `llvm::sys::fs::real_path` — resolves symlinks and `..` segments and
+///      yields an absolute path. Only succeeds if the file exists on disk.
 ///   2. `llvm::sys::fs::make_absolute` — succeeds for non-existent paths
-///      too; used for synthetic test fixtures whose FilePath may name a
-///      file that the merger never opened.
-///   3. Raw `FilePath` — last-resort fallback if both of the above fail.
-///      Emits a syntactically valid `file://` URI even if the underlying
-///      path is relative, matching the SARIF requirement's "absolute"
-///      promise loosely (downstream tooling that needs strict absolute
-///      URIs SHOULD canonicalize on its end if the disk state permits).
-std::string canonicalizeToFileUri(llvm::StringRef FilePath) {
+///      too, resolving a relative path against the merger's working
+///      directory. Its live consumer is `MainSourceFile`, which nothing
+///      existence-checks: a relative main file that is not on disk still
+///      gets an absolute spelling in the merged document. A Replacement
+///      whose raw spelling does not exist is dropped before this function
+///      sees it, and its diagnostic names that raw spelling, so for
+///      `FilePath` this step is reached only when real_path fails on a file
+///      that does exist.
+///   3. Raw `FilePath` — last-resort fallback if both of the above fail
+///      (no usable working directory).
+///
+/// An empty path is returned unchanged, before the chain runs: it is the
+/// spelling for "no file", and `make_absolute` would otherwise turn it into
+/// the working directory itself. This matters for `MainSourceFile: ''`
+/// (the value when the inputs disagree), which nothing existence-checks. A
+/// Replacement with an empty FilePath is dropped by the existence check on
+/// its raw spelling regardless, so for FilePath this is merely consistent.
+///
+/// Relative paths resolve against the merger's working directory, not the
+/// directory the compiler ran in when it recorded the FilePath. A caller
+/// that runs the merger elsewhere than the build ran gets a path that
+/// resolves to the wrong file or to no file at all.
+std::string canonicalizePath(llvm::StringRef FilePath) {
+  if (FilePath.empty())
+    return std::string();
   llvm::SmallString<256> Buf;
   if (!llvm::sys::fs::real_path(FilePath, Buf))
-    return "file://" + llvm::sys::path::convert_to_slash(Buf);
+    return std::string(Buf);
   Buf.assign(FilePath.begin(), FilePath.end());
   if (!llvm::sys::fs::make_absolute(Buf))
-    return "file://" + llvm::sys::path::convert_to_slash(Buf);
+    return std::string(Buf);
+  return FilePath.str();
+}
+
+/// Return `R` with its FilePath replaced by `canonicalizePath(FilePath)`;
+/// offset, length and text are untouched.
+clang::tooling::Replacement
+canonicalizeFilePath(const clang::tooling::Replacement &R) {
+  return clang::tooling::Replacement(canonicalizePath(R.getFilePath()),
+                                     R.getOffset(), R.getLength(),
+                                     R.getReplacementText());
+}
+
+/// Spell an already-canonical absolute path as a `file://` URI for SARIF.
+///
+/// Precondition: `FilePath` came through canonicalizeFilePath, so it is
+/// absolute wherever the fallback chain's step 1 or 2 succeeded. The URI is
+/// syntactically valid even in the step-3 case, matching the SARIF
+/// requirement's "absolute" promise loosely.
+std::string toFileUri(llvm::StringRef FilePath) {
   return "file://" + llvm::sys::path::convert_to_slash(FilePath);
 }
 
@@ -281,7 +339,7 @@ llvm::Error emitConflictSarif(
 
   for (const auto &Cluster : Clusters) {
     const clang::tooling::Replacement &Min = Cluster.front();
-    std::string Uri = canonicalizeToFileUri(Min.getFilePath());
+    std::string Uri = toFileUri(Min.getFilePath());
 
     // Re-sort cluster members locally by (byteLength, text) ascending.
     std::vector<clang::tooling::Replacement> Sorted(Cluster.begin(),
@@ -409,15 +467,53 @@ int main(int argc, const char **argv) {
     return 1;
   }
 
-  // Read all inputs.
+  // Read all inputs, canonicalizing every path on the way in: each
+  // Replacement's FilePath and the TU's MainSourceFile. Every comparison
+  // below — the pre-dedup set, the per-file buckets, the conflict clusters,
+  // computeMainSourceFile's agreement test, the stderr and SARIF reports and
+  // the merged output itself — keys on the path as a string, and only a
+  // canonical string makes two spellings of one file compare equal.
+  //
+  // Whether a Replacement's file exists is decided here too, on the raw
+  // spelling and before it is replaced. A Replacement targeting a file that
+  // doesn't exist can never be applied, so it is excluded from the merged
+  // output; testing the raw spelling keeps canonicalization from creating
+  // existence — realpath(3) on macOS resolves 'foo.cpp/' and 'foo.cpp/.' to
+  // the regular file foo.cpp, and make_absolute resolves '' to the working
+  // directory, all of which exist. Each Replacement's own spelling decides
+  // its own fate: an input that spells one file both ways keeps the edit
+  // that spelled it correctly and loses the one that did not.
+  //
+  // The two spellings serve different jobs. The canonical one is the key:
+  // everything that compares or emits paths uses it. The raw one is the
+  // diagnosis: what did not exist is what the producer wrote, it is the only
+  // string the reader can search their YAML for, and the canonical form of
+  // a spelling like 'foo.cpp/' names a file that does exist — beside a
+  // surviving edit to it, that message would contradict the document it
+  // accompanies. One line per distinct raw spelling.
   std::vector<clang::tooling::TranslationUnitReplacements> TUs;
   TUs.reserve(InputFiles.size());
+  std::set<std::string> MissingSpellings;
   for (const std::string &Path : InputFiles) {
     clang::tooling::TranslationUnitReplacements TU;
     if (!readInput(Path, TU))
       return 1;
+    TU.MainSourceFile = canonicalizePath(TU.MainSourceFile);
+    std::vector<clang::tooling::Replacement> Kept;
+    Kept.reserve(TU.Replacements.size());
+    for (const clang::tooling::Replacement &R : TU.Replacements) {
+      if (!llvm::sys::fs::exists(R.getFilePath())) {
+        MissingSpellings.insert(R.getFilePath().str());
+        continue;
+      }
+      Kept.push_back(canonicalizeFilePath(R));
+    }
+    TU.Replacements = std::move(Kept);
     TUs.push_back(std::move(TU));
   }
+  for (const std::string &F : MissingSpellings)
+    llvm::errs() << ToolName << ": " << llvm::formatv(MissingReplacementFile, F)
+                 << "\n";
 
   // Pre-deduplicate identical replacements across all input TUs.
   //
@@ -427,6 +523,8 @@ int main(int argc, const char **argv) {
   // Replacement is considered exactly once below. The first occurrence (in
   // input-file order, then within-file order) wins; later duplicates are
   // byte-identical to it, so which one is "first" is observationally moot.
+  // `file` here is the canonical path, so two TUs that spelled one shared
+  // header differently collapse here just as two that spelled it alike do.
   {
     std::set<clang::tooling::Replacement> SeenKeys;
     for (auto &TU : TUs) {
@@ -440,23 +538,6 @@ int main(int argc, const char **argv) {
     }
   }
 
-  // Determine which input files exist on disk. A Replacement targeting a
-  // file that doesn't exist can never be applied, so every Replacement
-  // targeting that file is excluded from the merged output.
-  std::set<std::string> MissingFiles;
-  {
-    std::set<std::string> AllFiles;
-    for (const auto &TU : TUs)
-      for (const auto &R : TU.Replacements)
-        AllFiles.insert(R.getFilePath().str());
-    for (const std::string &F : AllFiles)
-      if (!llvm::sys::fs::exists(F))
-        MissingFiles.insert(F);
-  }
-  for (const std::string &F : MissingFiles)
-    llvm::errs() << ToolName << ": " << llvm::formatv(MissingReplacementFile, F)
-                 << "\n";
-
   // Split every surviving-candidate Replacement by file. Zero-length
   // insertions go straight into SurvivorsByFile — they can never overlap
   // anything, so they're never at risk of being dropped. Length > 0 entries
@@ -466,8 +547,6 @@ int main(int argc, const char **argv) {
   std::map<std::string, std::set<clang::tooling::Replacement>> InputKeysByFile;
   for (const auto &TU : TUs) {
     for (const auto &R : TU.Replacements) {
-      if (MissingFiles.count(R.getFilePath().str()))
-        continue;
       if (R.getLength() == 0)
         SurvivorsByFile[R.getFilePath().str()].insert(R);
       else

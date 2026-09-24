@@ -1,0 +1,41 @@
+# The shape the extractor actually produces, with the two spellings from
+# issue #48's reproduction: a zero-length insertion into a shared header,
+# recorded as './inc/shared.h' by the TU that included "inc/shared.h" and
+# as the absolute path by the TU that reached it through -I.
+#
+# Zero-length insertions never enter the conflict-cluster machinery — they
+# go straight to the survivor set — so the ONLY thing that deduplicates them
+# is the pre-dedup pass keyed on (file, offset, length, text). That pass
+# therefore has to see one canonical file path, or both insertions survive
+# and clang-apply-replacements inserts the attribute twice.
+
+# RUN: rm -rf %t.dir
+# RUN: mkdir -p %t.dir/inc %t.dir/sub
+# RUN: printf '%%80s' '' > %t.dir/inc/shared.h
+# RUN: printf '%%80s' '' > %t.dir/a.c
+# RUN: printf '%%80s' '' > %t.dir/sub/b.c
+
+# RUN: cp %S/Inputs/single-zero-length-insert.tpl.yaml %t.dir/a.yaml
+# RUN: cp %S/Inputs/single-zero-length-insert.tpl.yaml %t.dir/b.yaml
+# (One -e per sed: under lit, BSD sed binds -i's suffix to the next word.)
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'a.c'|; s|@FOO@|./inc/shared.h|g" %t.dir/a.yaml
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'sub/b.c'|; s|@FOO@|%/t.dir/inc/shared.h|g" %t.dir/b.yaml
+
+# RUN: cd %t.dir && clang-ssaf-src-edit-merge -o %t.dir/merged.yaml \
+# RUN:     %t.dir/a.yaml %t.dir/b.yaml 2> %t.dir/stderr.txt
+
+# Exactly ONE insertion survives, at the canonical path. The two inputs
+# name different main source files, so MainSourceFile is ''. Path literals
+# assume a symlink-free %t; see canonical-path-dedup.test.
+# RUN: FileCheck --input-file=%t.dir/merged.yaml -DDIR=%/t.dir %s
+# CHECK:      MainSourceFile:  ''
+# CHECK-NEXT: Replacements:
+# CHECK-NEXT:   - FilePath:        '[[DIR]]/inc/shared.h'
+# CHECK-NEXT:     Offset:          10
+# CHECK-NEXT:     Length:          0
+# CHECK-NEXT:     ReplacementText: '.data()'
+# CHECK-NEXT: ...
+# CHECK-NOT: FilePath:
+
+# RUN: FileCheck --input-file=%t.dir/stderr.txt --allow-empty --check-prefix=NOSTDERR %s
+# NOSTDERR-NOT: {{conflict:|does not exist}}

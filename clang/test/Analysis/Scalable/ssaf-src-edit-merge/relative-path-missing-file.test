@@ -1,0 +1,42 @@
+# A relative path naming a file that does not exist cannot be resolved
+# through real_path (which needs the file on disk), so canonicalization
+# falls back to making it absolute against the working directory.
+#
+# For a Replacement, the missing file's edit is dropped and the diagnostic
+# names the spelling as the input gave it — what the producer wrote and the
+# only string the reader can search their YAML for — so the make_absolute
+# fallback is not observable through FilePath. It is observable through
+# MainSourceFile, which is never existence-checked: both inputs name a main
+# source file that does not exist, by the same relative spelling, and the
+# merged document carries its absolute form.
+
+# RUN: rm -rf %t.dir
+# RUN: mkdir -p %t.dir
+# RUN: printf '%%80s' '' > %t.dir/foo.cpp
+
+# RUN: cp %S/Inputs/non-overlapping-a.tpl.yaml %t.dir/a.yaml
+# RUN: cp %S/Inputs/single-replacement.tpl.yaml %t.dir/b.yaml
+# (One -e per sed: under lit, BSD sed binds -i's suffix to the next word.)
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'nope/missing.c'|; s|@FOO@|nope/missing.cpp|g" %t.dir/a.yaml
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'nope/missing.c'|; s|@FOO@|%/t.dir/foo.cpp|g" %t.dir/b.yaml
+
+# RUN: cd %t.dir && clang-ssaf-src-edit-merge -o %t.dir/merged.yaml \
+# RUN:     %t.dir/a.yaml %t.dir/b.yaml 2> %t.dir/stderr.txt
+
+# The diagnostic names the raw spelling.
+# RUN: FileCheck --input-file=%t.dir/stderr.txt --check-prefix=STDERR %s
+# STDERR:     clang-ssaf-src-edit-merge: nope/missing.cpp: file does not exist; skipping its replacement(s)
+# STDERR-NOT: {{.}}
+
+# foo.cpp's edit is untouched. What pins "the missing file's edit is gone"
+# is the `...` terminator directly after the one surviving entry — a second
+# entry would land between them and break the CHECK-NEXT chain. Path
+# literals assume a symlink-free %t; see canonical-path-dedup.test.
+# RUN: FileCheck --input-file=%t.dir/merged.yaml -DDIR=%/t.dir %s
+# CHECK:      MainSourceFile:  '[[DIR]]/nope/missing.c'
+# CHECK-NEXT: Replacements:
+# CHECK-NEXT:   - FilePath:        '[[DIR]]/foo.cpp'
+# CHECK-NEXT:     Offset:          10
+# CHECK-NEXT:     Length:          3
+# CHECK-NEXT:     ReplacementText: X
+# CHECK-NEXT: ...

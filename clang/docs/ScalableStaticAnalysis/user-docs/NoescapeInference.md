@@ -118,6 +118,12 @@ byte-identical insertions that step 5 can deduplicate. A project that wants
 `NS_NOESCAPE`, or a macro of its own, passes it here — and must pass the same
 spelling for every translation unit sharing a header, for the same reason.
 
+The merge keys each edit on the canonical absolute path of the file it edits,
+not on the path as the compiler spelled it, so a header one translation unit
+reached through a quoted relative include and another through `-I` is still
+recognized as one file and its edits collapse to one. The merged YAML carries
+those absolute paths, and is meaningful from any working directory.
+
 The pipeline is idempotent: a second full run over the rewritten tree proposes
 no edits, which is what makes it safe to run inside a build.
 
