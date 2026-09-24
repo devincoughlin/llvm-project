@@ -491,6 +491,13 @@ public:
           << EscapeGlobal->getEndLoc();
   }
 
+  void noteNoescapeAnnotation(SourceLocation AnnotationLoc,
+                              bool AppearsInSource) override {
+    S.Diag(AnnotationLoc,
+           AppearsInSource ? diag::note_lifetime_safety_noescape_here
+                           : diag::note_lifetime_safety_noescape_not_written);
+  }
+
   void addLifetimeBoundToImplicitThis(const CXXMethodDecl *MD) override {
     S.addLifetimeBoundToImplicitThis(const_cast<CXXMethodDecl *>(MD));
   }

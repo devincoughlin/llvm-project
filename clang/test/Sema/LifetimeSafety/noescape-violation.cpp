@@ -1,4 +1,11 @@
-// RUN: %clang_cc1 -fsyntax-only -flifetime-safety-inference -Wlifetime-safety-noescape -Wlifetime-safety-annotation-placement -verify %s
+// -Wlifetime-safety-lifetimebound-violation is enabled so that this file also
+// asserts the *absence* of that diagnostic. A parameter carrying both
+// noescape and lifetimebound -- both_noescape_and_lifetimebound below -- used
+// to draw a spurious "could not verify that the return value can be lifetime
+// bound" alongside the noescape violation, because reporting the latter
+// returned before recording the return escape. Any recurrence shows up here as
+// an unexpected diagnostic.
+// RUN: %clang_cc1 -fsyntax-only -flifetime-safety-inference -Wlifetime-safety-noescape -Wlifetime-safety-annotation-placement -Wlifetime-safety-lifetimebound-violation -verify %s
 
 #include "Inputs/lifetime-analysis.h"
 

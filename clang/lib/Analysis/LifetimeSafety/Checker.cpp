@@ -57,9 +57,24 @@ using EscapingTarget = LifetimeSafetySemaHelper::EscapingTarget;
 
 class LifetimeChecker {
 private:
+  /// Where a parameter's `noescape` was found, for the note that accompanies
+  /// the violation. \c Loc is what to point the note at, and \c AppearsInSource
+  /// says whether the attribute is spelled there.
+  struct NoEscapeOrigin {
+    SourceLocation Loc;
+    bool AppearsInSource;
+  };
+
+  /// A pending noescape violation: what the parameter escaped to, and where
+  /// the `noescape` that forbids it was found.
+  struct NoescapeViolation {
+    EscapingTarget Target;
+    NoEscapeOrigin Origin;
+  };
+
   llvm::DenseMap<LoanID, PendingWarning> FinalWarningsMap;
   llvm::DenseMap<AnnotationTarget, EscapingTarget> AnnotationWarningsMap;
-  llvm::DenseMap<const ParmVarDecl *, EscapingTarget> NoescapeWarningsMap;
+  llvm::DenseMap<const ParmVarDecl *, NoescapeViolation> NoescapeWarningsMap;
   llvm::DenseSet<const Decl *> VerifiedLiftimeboundEscapes;
   const LoanPropagationAnalysis &LoanPropagation;
   const MovedLoansAnalysis &MovedLoans;
@@ -120,6 +135,152 @@ public:
       inferAnnotations();
   }
 
+  /// The origin of a NoEscapeAttr found on \p Param, or std::nullopt if it has
+  /// none. API Notes build the attribute with no source location
+  /// (SemaAPINotes.cpp's getPlaceholderAttrInfo), so in that case the note
+  /// points at the declaration the attribute was applied to rather than at
+  /// nothing.
+  static std::optional<NoEscapeOrigin>
+  noEscapeOriginOf(const ParmVarDecl *Param) {
+    const auto *A = Param->getAttr<NoEscapeAttr>();
+    if (!A)
+      return std::nullopt;
+    if (A->getLocation().isValid())
+      return NoEscapeOrigin{A->getLocation(), /*AppearsInSource=*/true};
+    return NoEscapeOrigin{Param->getLocation(), /*AppearsInSource=*/false};
+  }
+
+  /// Returns where the parameter at \p PVD's index is annotated
+  /// [[clang::noescape]], looking at the definition and at every redeclaration
+  /// in its chain, or std::nullopt if none is.
+  ///
+  /// Reading only the definition's ParmVarDecl is not enough, and this is
+  /// deliberately a different question from the one the type system answers.
+  /// NoEscape is a plain Attr, not an InheritableParamAttr, so
+  /// mergeParamDeclAttributes never copies it onto a later declaration; and the
+  /// FunctionProtoType's ExtParameterInfo bit is AND-merged across
+  /// redeclarations by ASTContext::mergeExtParameterInfo -- it is the only such
+  /// bit permitted to differ, and the composite type is deliberately the weaker
+  /// one, so that a declaration whose annotation disagrees with the definition
+  /// stays legal. When a declaration is annotated and the definition is not,
+  /// the definition therefore has neither the attribute nor the type bit, and
+  /// CodeGen emits no captures(address) promise. In C nothing diagnoses that.
+  ///
+  /// This check disagrees with the merged type on purpose. Its job is to audit
+  /// the annotations that this project's cross-TU inference *trusted*, and the
+  /// inference trusts a noescape found on a redeclaration's parameter or in the
+  /// function type: ParameterEscape's
+  /// EscapeClassifier::paramIsDeclaredNoescape looks in both places, by
+  /// parameter index, and records no escape edge for a parameter it finds
+  /// annotated in either. Looking anywhere less would leave those trusted
+  /// inputs unaudited, so both places are checked here too:
+  ///
+  ///  - the attribute on a redeclaration's ParmVarDecl. API Notes reach the
+  ///    audit only this way: they attach NoEscapeAttr to the imported header's
+  ///    declaration (SemaAPINotes.cpp), with no source location and without
+  ///    setting the type bit.
+  ///  - the ExtParameterInfo bit in a redeclaration's FunctionProtoType. A
+  ///    function declared through a typedef of function type reaches the audit
+  ///    only this way: `typedef void S(int *__attribute__((noescape))); S f;`
+  ///    gives `f` implicit ParmVarDecls that carry no attribute while its type
+  ///    carries the bit.
+  ///
+  /// This is a strict superset of what paramIsDeclaredNoescape consults, not a
+  /// match: that function walks the redeclarations' *attributes* but only one
+  /// type, the FunctionDecl it was handed, whereas the loop below consults
+  /// every redeclaration's type. Being a superset is precisely what makes it
+  /// safe for an audit: it cannot leave a trusted annotation unchecked, because
+  /// anything the inference found is also found here.
+  ///
+  /// It does find annotations the inference did not, and that is fine. For
+  /// `typedef void S(int *__attribute__((noescape))); S f; void f(int *p);`
+  /// with a definition that escapes, no NoEscapeAttr node exists anywhere --
+  /// the annotation lives only in the first declaration's type sugar -- and
+  /// every call resolves to the most recent declaration, whose AND-merged type
+  /// has lost the bit, so paramIsDeclaredNoescape returns false at each call
+  /// site and the inference never trusts it. The audit reports it anyway, and
+  /// the report is correct: `noescape` was written on a declaration of `f`, and
+  /// `f` escapes its parameter. The excess concerns annotations genuinely
+  /// present somewhere in the chain, never fabricated ones.
+  ///
+  /// Within that, the *definition's* own merged type could be skipped without
+  /// loss, because the AND-merge means the bit survives there only when every
+  /// redeclaration had it, including the definition, whose own parameter then
+  /// carries the attribute. It is the redeclarations' types that have to be
+  /// consulted; including the definition's costs nothing.
+  ///
+  /// The divergence from the type system already existed in the other
+  /// direction -- a definition-annotated function whose merged type lost the
+  /// bit is warned about here while CodeGen declines the promise -- so this
+  /// makes an existing asymmetry symmetric rather than introducing one.
+  ///
+  /// Parameters are matched by index, as suggestWithScopeForParmVar and
+  /// Sema::MergeCompatibleFunctionDecls both do. The bound checks are
+  /// load-bearing: an unprototyped C declaration that precedes any prototype
+  /// keeps the type `T()` and is given no ParmVarDecl at all, so its parameter
+  /// count is zero while the definition's is not.
+  ///
+  /// The loops walk the whole redecls() chain and filter nothing by position.
+  /// What differs between the analysis modes is which redeclarations *exist*
+  /// when the walk runs, not which of them it looks at. In per-function mode
+  /// the analysis runs at the end of each function body, so a redeclaration
+  /// parsed afterwards has not been created yet and cannot be in the chain; in
+  /// translation-unit mode it has been, and the violation is reported. The
+  /// inference trusts such an annotation either way, so per-function mode
+  /// under-reports. That is inherent to analyzing a function before the TU is
+  /// complete and cannot be fixed here -- and in particular, do not add a
+  /// position filter to make this code look like it only considers preceding
+  /// declarations, because that would break TU-mode reporting.
+  ///
+  /// The dyn_cast is defensive and cannot currently fail: a noescape audit is
+  /// only ever reached through a PlaceholderBase carrying a ParmVarDecl, and
+  /// FactsGenerator::issuePlaceholderLoans creates none unless the analyzed
+  /// decl is a FunctionDecl. A block parameter and an Objective-C method
+  /// parameter therefore get no noescape audit at all, before or after this
+  /// change -- not a definition-only one.
+  std::optional<NoEscapeOrigin>
+  findNoEscapeAnnotation(const ParmVarDecl *PVD) const {
+    // An attribute *written on* this parameter, handled first and deliberately
+    // yielding no note location: the warning is emitted at this very parameter,
+    // so a note saying the attribute is here too would be noise. This branch is
+    // redundant for deciding *whether* the parameter is noescape -- redecls()
+    // includes the definition and PVD is one of its parameters, so the loop
+    // below would find it -- and exists only to suppress that note.
+    //
+    // The predicate is written-ness, not presence, and the difference is not
+    // cosmetic. API Notes build the attribute with no source location and, when
+    // the definition lives in a header they annotate, attach it to every
+    // redeclaration including the definition. Testing hasAttr would then
+    // suppress the note for a definition that spells no annotation, which is
+    // exactly the case the note exists for. Falling through to the loop lets
+    // noEscapeOriginOf name the declaration instead.
+    if (const auto *OwnAttr = PVD->getAttr<NoEscapeAttr>();
+        OwnAttr && OwnAttr->getLocation().isValid())
+      return NoEscapeOrigin{SourceLocation(), /*AppearsInSource=*/true};
+    const auto *Func = dyn_cast<FunctionDecl>(FD);
+    if (!Func)
+      return std::nullopt;
+    unsigned Index = PVD->getFunctionScopeIndex();
+    // A written attribute anywhere in the chain beats a type bit anywhere,
+    // which is why this is two passes rather than one. A single pass points the
+    // note at whichever the traversal reaches first, and the two are not
+    // equally good: an unprototyped redeclaration composes to the prototype's
+    // type and so carries the bit, so a chain of `f(int *noescape); f();`
+    // would be explained by pointing at the `f();` and saying the annotation is
+    // not written there -- while it is written one line up.
+    for (const FunctionDecl *Redecl : Func->redecls())
+      if (Index < Redecl->getNumParams())
+        if (auto Found = noEscapeOriginOf(Redecl->getParamDecl(Index)))
+          return Found;
+    for (const FunctionDecl *Redecl : Func->redecls())
+      if (const auto *FPT = Redecl->getType()->getAs<FunctionProtoType>())
+        if (Index < FPT->getNumParams() &&
+            FPT->getExtParameterInfo(Index).isNoEscape())
+          return NoEscapeOrigin{Redecl->getLocation(),
+                                /*AppearsInSource=*/false};
+    return std::nullopt;
+  }
+
   /// Checks if an escaping origin holds a placeholder loan, indicating a
   /// missing [[clang::lifetimebound]] annotation or a violation of
   /// [[clang::noescape]].
@@ -128,13 +289,26 @@ public:
     LoanSet EscapedLoans = LoanPropagation.getLoans(EscapedOID, OEF);
     auto CheckParam = [&](const ParmVarDecl *PVD, bool IsMoved) {
       // NoEscape param should not escape.
-      if (PVD->hasAttr<NoEscapeAttr>()) {
+      if (auto Origin = findNoEscapeAnnotation(PVD)) {
         if (auto *ReturnEsc = dyn_cast<ReturnEscapeFact>(OEF))
-          NoescapeWarningsMap.try_emplace(PVD, ReturnEsc->getReturnExpr());
+          NoescapeWarningsMap.try_emplace(
+              PVD, NoescapeViolation{ReturnEsc->getReturnExpr(), *Origin});
         if (auto *FieldEsc = dyn_cast<FieldEscapeFact>(OEF))
-          NoescapeWarningsMap.try_emplace(PVD, FieldEsc->getFieldDecl());
+          NoescapeWarningsMap.try_emplace(
+              PVD, NoescapeViolation{FieldEsc->getFieldDecl(), *Origin});
         if (auto *GlobalEsc = dyn_cast<GlobalEscapeFact>(OEF))
-          NoescapeWarningsMap.try_emplace(PVD, GlobalEsc->getGlobal());
+          NoescapeWarningsMap.try_emplace(
+              PVD, NoescapeViolation{GlobalEsc->getGlobal(), *Origin});
+        // A parameter can carry both attributes. Returning without recording
+        // the lifetimebound escape makes reportLifetimeboundViolations
+        // conclude it never escapes, adding a second and false "could not
+        // verify that the return value can be lifetime bound" about a
+        // function that demonstrably does return it. Mirrors the conditions
+        // in the lifetimebound branch below.
+        if (!IsMoved && PVD->hasAttr<LifetimeBoundAttr>() &&
+            (isa<ReturnEscapeFact>(OEF) ||
+             (isa<FieldEscapeFact>(OEF) && isa<CXXConstructorDecl>(FD))))
+          VerifiedLiftimeboundEscapes.insert(PVD);
         return;
       }
       // Skip annotation suggestion for moved loans, as ownership transfer
@@ -446,7 +620,8 @@ public:
 
   void reportNoescapeViolations() {
     llvm::TimeTraceScope TimeTrace("ReportNoescapeViolations");
-    for (auto [PVD, EscapeTarget] : NoescapeWarningsMap) {
+    for (auto [PVD, Violation] : NoescapeWarningsMap) {
+      EscapingTarget EscapeTarget = Violation.Target;
       if (const auto *E = EscapeTarget.dyn_cast<const Expr *>())
         SemaHelper->reportNoescapeViolation(PVD, E);
       else if (const auto *FD = EscapeTarget.dyn_cast<const FieldDecl *>())
@@ -455,6 +630,14 @@ public:
         SemaHelper->reportNoescapeViolation(PVD, G);
       else
         llvm_unreachable("Unhandled EscapingTarget type");
+      // The warning is emitted at the definition's parameter, which for a
+      // header or API Notes annotation is a line that says nothing about
+      // noescape. Point at where the annotation actually is. An invalid
+      // location means the definition's own parameter carries it, so the
+      // warning already points at it and no note is wanted.
+      if (Violation.Origin.Loc.isValid())
+        SemaHelper->noteNoescapeAnnotation(Violation.Origin.Loc,
+                                           Violation.Origin.AppearsInSource);
     }
   }
 
