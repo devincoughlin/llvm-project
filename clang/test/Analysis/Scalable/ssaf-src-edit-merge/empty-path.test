@@ -1,0 +1,33 @@
+# An empty path is the spelling for "no file" and must survive
+# canonicalization unchanged: MainSourceFile is '' whenever the inputs
+# disagree, and a Replacement with an empty FilePath has no location.
+# make_absolute would otherwise resolve '' to the working directory, which
+# exists — so the empty-FilePath edit would stop being reported as missing
+# and instead survive into the merged output as an edit to a directory.
+# Measured, before the guard: FilePath '' became '<cwd>/' and survived.
+#
+# Canonicalization may rename a path; it never creates existence. Existence
+# is decided on the raw spelling, so '' is dropped exactly as before #48.
+
+# RUN: rm -rf %t.dir
+# RUN: mkdir -p %t.dir
+# RUN: cp %S/Inputs/single-replacement.tpl.yaml %t.dir/a.yaml
+# (One -e per sed: under lit, BSD sed binds -i's suffix to the next word.)
+# RUN: sed -i'' -e "s|@FOO@||g" %t.dir/a.yaml
+
+# RUN: cd %t.dir && clang-ssaf-src-edit-merge -o %t.dir/merged.yaml %t.dir/a.yaml \
+# RUN:     2> %t.dir/stderr.txt
+
+# The soundness property first: nothing survives, and MainSourceFile is
+# still ''. This must precede the stderr check — every defect that lets the
+# edit survive also removes the missing-file line, so the stderr FileCheck
+# would die on empty input (exit 2, the same signal as a mistyped redirect)
+# before this assertion ever ran.
+# RUN: FileCheck --input-file=%t.dir/merged.yaml %s
+# CHECK:      MainSourceFile:  ''
+# CHECK-NEXT: Replacements:    []
+# CHECK-NEXT: ...
+
+# Reported as missing under its own (empty) name, exactly as before #48.
+# RUN: FileCheck --input-file=%t.dir/stderr.txt --check-prefix=STDERR %s
+# STDERR: clang-ssaf-src-edit-merge: : file does not exist; skipping its replacement(s)

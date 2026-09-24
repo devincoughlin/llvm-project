@@ -1,0 +1,71 @@
+# Canonicalization may rename a path; it never creates existence.
+#
+# macOS realpath(3) strips a trailing '/' and a trailing '/.' even from a
+# regular file, against POSIX's "must name a directory" reading, so
+# 'foo.cpp/' and 'foo.cpp/.' resolve to the existing regular file foo.cpp.
+# Before #48 the tool tested existence on the spelling as given and refused
+# both ('foo.cpp/: file does not exist'). Testing existence on the canonical
+# spelling instead would turn each into a valid, applicable edit to a real
+# source file — a producer that joined a directory and a file name and left
+# the separator, with an offset computed for some other file, would be
+# silently accepted where it used to be diagnosed. So existence is decided
+# on the raw spelling, before canonicalization replaces it — and a spelling
+# that fails is never canonicalized at all, so what realpath(3) does with
+# the slash is on no path this test exercises. The diagnostic names the raw
+# spelling: what the producer wrote and what did not exist, spelled the same
+# on every platform, where the canonical form would name a file that exists.
+#
+# Two scenarios share this file. The mixed one runs first because its
+# assertion states the soundness property: when two scenarios share one
+# .test in this suite, the one whose assertion states the soundness
+# property runs first, or gets its own file — an earlier RUN line that
+# fails stops lit before a later one is reached, so a later block's power
+# is never observed.
+
+# RUN: rm -rf %t.dir
+# RUN: mkdir -p %t.dir
+# RUN: printf '%%80s' '' > %t.dir/foo.cpp
+# RUN: printf '%%80s' '' > %t.dir/main.c
+
+# a and b spell foo.cpp wrongly and carry X at offset 10; c spells it
+# correctly and carries a DIFFERENT edit, P at offset 30, so that "every
+# edit survived" and "only the correct one survived" produce different
+# documents rather than collapsing to one entry in the pre-dedup pass.
+# RUN: cp %S/Inputs/single-replacement.tpl.yaml %t.dir/a.yaml
+# RUN: cp %S/Inputs/single-replacement.tpl.yaml %t.dir/b.yaml
+# RUN: cp %S/Inputs/single-replacement-offset-30.tpl.yaml %t.dir/c.yaml
+# (One -e per sed: under lit, BSD sed binds -i's suffix to the next word.)
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'main.c'|; s|@FOO@|foo.cpp/|g" %t.dir/a.yaml
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'main.c'|; s|@FOO@|foo.cpp/.|g" %t.dir/b.yaml
+# RUN: sed -i'' -e "s|MainSourceFile:  '@FOO@'|MainSourceFile:  'main.c'|; s|@FOO@|foo.cpp|g" %t.dir/c.yaml
+
+# Mixed: all three canonicalize to one path, but each Replacement's own
+# spelling decides its own fate. Exactly c's edit survives — a per-file
+# verdict would either keep a's and b's too (two entries) or lose c's (none).
+# Path literals assume a symlink-free %t; see canonical-path-dedup.test.
+# RUN: cd %t.dir && clang-ssaf-src-edit-merge -o %t.dir/merged-abc.yaml \
+# RUN:     %t.dir/a.yaml %t.dir/b.yaml %t.dir/c.yaml 2> %t.dir/stderr-abc.txt
+# RUN: FileCheck --input-file=%t.dir/merged-abc.yaml -DDIR=%/t.dir --check-prefix=ABC %s
+# ABC:      MainSourceFile:  '[[DIR]]/main.c'
+# ABC-NEXT: Replacements:
+# ABC-NEXT:   - FilePath:        '[[DIR]]/foo.cpp'
+# ABC-NEXT:     Offset:          30
+# ABC-NEXT:     Length:          3
+# ABC-NEXT:     ReplacementText: P
+# ABC-NEXT: ...
+# RUN: FileCheck --input-file=%t.dir/stderr-abc.txt --check-prefix=ABC-STDERR %s
+# ABC-STDERR:      clang-ssaf-src-edit-merge: foo.cpp/: file does not exist; skipping its replacement(s)
+# ABC-STDERR-NEXT: clang-ssaf-src-edit-merge: foo.cpp/.: file does not exist; skipping its replacement(s)
+# ABC-STDERR-NOT:  {{.}}
+
+# Malformed spellings alone: nothing survives.
+# RUN: cd %t.dir && clang-ssaf-src-edit-merge -o %t.dir/merged-ab.yaml \
+# RUN:     %t.dir/a.yaml %t.dir/b.yaml 2> %t.dir/stderr-ab.txt
+# RUN: FileCheck --input-file=%t.dir/merged-ab.yaml -DDIR=%/t.dir --check-prefix=AB %s
+# AB:      MainSourceFile:  '[[DIR]]/main.c'
+# AB-NEXT: Replacements:    []
+# AB-NEXT: ...
+# RUN: FileCheck --input-file=%t.dir/stderr-ab.txt --check-prefix=AB-STDERR %s
+# AB-STDERR:      clang-ssaf-src-edit-merge: foo.cpp/: file does not exist; skipping its replacement(s)
+# AB-STDERR-NEXT: clang-ssaf-src-edit-merge: foo.cpp/.: file does not exist; skipping its replacement(s)
+# AB-STDERR-NOT:  {{.}}
