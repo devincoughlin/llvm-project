@@ -379,6 +379,12 @@ features cannot lower the translation-unit ABI level;
   };
   ```
 
+- Lifetime safety analysis is now enabled for C by default. The `-fexperimental-lifetime-safety-c`
+  flag is renamed to `-flifetime-safety-c`. Use `-fno-lifetime-safety-c` to disable it.
+  The old flag was `-cc1`-only, so an existing `-Xclang -fexperimental-lifetime-safety-c`
+  becomes a plain `-flifetime-safety-c` with the `-Xclang` dropped;
+  `-Xclang -flifetime-safety-c` is an error.
+
 - Improved `-Wassign-enum` performance by caching enum enumerator values. (#GH176454)
 
 - Fixed a false negative in `-Warray-bounds` where the warning was suppressed
