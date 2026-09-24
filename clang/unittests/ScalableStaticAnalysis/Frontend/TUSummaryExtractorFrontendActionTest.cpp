@@ -9,6 +9,7 @@
 #include "clang/ScalableStaticAnalysis/Frontend/TUSummaryExtractorFrontendAction.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/DeclGroup.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendOptions.h"
 #include "clang/Frontend/SSAFOptions.h"
@@ -33,11 +34,22 @@
 using namespace clang;
 using namespace ssaf;
 using ::testing::Contains;
+using ::testing::Not;
 using ::testing::UnorderedElementsAre;
+
+using EventLog = std::vector<std::string>;
 
 static auto errorsMsgsOf(const TextDiagnosticBuffer &Diags) {
   auto Errors = llvm::make_range(Diags.err_begin(), Diags.err_end());
   return llvm::make_second_range(Errors);
+}
+
+/// The same messages as a container, for the gmock matchers that need a
+/// value_type -- Contains() among them, which llvm::iterator_range lacks.
+static std::vector<std::string>
+errorMsgsVecOf(const TextDiagnosticBuffer &Diags) {
+  auto R = errorsMsgsOf(Diags);
+  return std::vector<std::string>(R.begin(), R.end());
 }
 namespace {
 
@@ -51,6 +63,32 @@ public:
 
 static TUSummaryExtractorRegistry::Add<NoOpExtractor>
     RegisterNoOp("NoOpExtractor", "No-op extractor for frontend action tests");
+
+namespace {
+/// A TUSummaryExtractor that records which ASTConsumer callbacks it received,
+/// so a test can tell whether the runner drove it at all.
+class RecordingExtractor : public TUSummaryExtractor {
+public:
+  using TUSummaryExtractor::TUSummaryExtractor;
+
+  static EventLog &log() {
+    static EventLog Log;
+    return Log;
+  }
+
+  bool HandleTopLevelDecl(DeclGroupRef D) override {
+    log().push_back("RecordingExtractor::HandleTopLevelDecl");
+    return true;
+  }
+  void HandleTranslationUnit(ASTContext &Ctx) override {
+    log().push_back("RecordingExtractor::HandleTranslationUnit");
+  }
+};
+} // namespace
+
+static TUSummaryExtractorRegistry::Add<RecordingExtractor> RegisterRecording(
+    "RecordingExtractor",
+    "Extractor that records its callbacks, for frontend action tests");
 
 namespace {
 class FailingSerializationFormat final : public SerializationFormat {
@@ -263,8 +301,6 @@ static SerializationFormatRegistry::Add<CapturingSerializationFormat>
         "CapturingSerializationFormat",
         "A serialization format that captures the CU namespace name.");
 
-using EventLog = std::vector<std::string>;
-
 namespace {
 
 /// An ASTConsumer that logs callback invocations into a shared log.
@@ -311,12 +347,15 @@ public:
 };
 
 /// Creates a CompilerInstance configured with an in-memory "test.cc" file
-/// containing "int x = 42;".
+/// containing \p Source, which defaults to "int x = 42;".
 static std::unique_ptr<CompilerInstance>
-makeCompiler(TextDiagnosticBuffer &DiagBuf) {
+makeCompiler(TextDiagnosticBuffer &DiagBuf, StringRef Source = "int x = 42;",
+             ArrayRef<std::string> Warnings = {}) {
   auto Invocation = std::make_shared<CompilerInvocation>();
+  // Set before createDiagnostics(), which is what applies these mappings.
+  llvm::append_range(Invocation->getDiagnosticOpts().Warnings, Warnings);
   Invocation->getPreprocessorOpts().addRemappedFile(
-      "test.cc", llvm::MemoryBuffer::getMemBuffer("int x = 42;").release());
+      "test.cc", llvm::MemoryBuffer::getMemBufferCopy(Source).release());
   Invocation->getFrontendOpts().Inputs.push_back(
       FrontendInputFile("test.cc", Language::CXX));
   Invocation->getFrontendOpts().ProgramAction = frontend::ParseSyntaxOnly;
@@ -340,6 +379,12 @@ struct TUSummaryExtractorFrontendActionTest : testing::Test {
   }
 
   void TearDown() override { llvm::sys::fs::remove_directories(TestDir); }
+
+  /// Replaces \c Compiler with one over \p Source, optionally with \p Warnings
+  /// appended to the diagnostic options (e.g. "error=unused-variable").
+  void resetCompiler(StringRef Source, ArrayRef<std::string> Warnings = {}) {
+    Compiler = makeCompiler(DiagBuf, Source, Warnings);
+  }
 
   std::string makePath(llvm::StringRef FileOrDirectoryName) const {
     PathString FullPath = TestDir;
@@ -580,6 +625,105 @@ TEST_F(TUSummaryExtractorFrontendActionTest,
   EXPECT_EQ(DiagBuf.getNumErrors(), 0U);
 
   EXPECT_EQ(CapturingSerializationFormat::lastCapturedName(), CUId);
+}
+
+// A TU that failed to compile must not produce a summary: its facts would come
+// from an error-recovery AST, where a use the analysis relies on seeing may be
+// absent, and a missing use is a missing escape.
+
+TEST_F(TUSummaryExtractorFrontendActionTest,
+       CompileErrorRefusesSummaryAndDiagnoses) {
+  resetCompiler("void broken() { undeclared_identifier_45; }");
+
+  std::string Output = makePath("output.MockSerializationFormat");
+  Compiler->getSSAFOpts().TUSummaryFile = Output;
+  Compiler->getSSAFOpts().ExtractSummaries = {"NoOpExtractor"};
+  Compiler->getSSAFOpts().CompilationUnitId = "test-cu";
+
+  TUSummaryExtractorFrontendAction Action(std::make_unique<RecordingAction>());
+  Compiler->ExecuteAction(Action);
+
+  EXPECT_THAT(errorMsgsVecOf(DiagBuf),
+              Contains("not writing TU summary to '" + Output +
+                       "': this translation unit failed to compile, so its "
+                       "summary would describe an error-recovery AST"));
+  EXPECT_FALSE(llvm::sys::fs::exists(Output));
+}
+
+TEST_F(TUSummaryExtractorFrontendActionTest,
+       CompileErrorRefusesSummaryBeforeRunningExtractors) {
+  resetCompiler("void broken() { undeclared_identifier_45; }");
+
+  std::string Output = makePath("output.MockSerializationFormat");
+  Compiler->getSSAFOpts().TUSummaryFile = Output;
+  // A recording extractor, so we can see whether it was driven at all.
+  Compiler->getSSAFOpts().ExtractSummaries = {"RecordingExtractor"};
+  Compiler->getSSAFOpts().CompilationUnitId = "test-cu";
+
+  RecordingExtractor::log().clear();
+
+  TUSummaryExtractorFrontendAction Action(std::make_unique<RecordingAction>());
+  Compiler->ExecuteAction(Action);
+
+  // The guard precedes the extractors, so no analysis walks the broken AST.
+  // HandleTopLevelDecl still runs -- it is driven by the parser, not by the
+  // runner -- so asserting only on HandleTranslationUnit is what pins the
+  // placement.
+  EXPECT_THAT(RecordingExtractor::log(),
+              Contains("RecordingExtractor::HandleTopLevelDecl"));
+  EXPECT_THAT(RecordingExtractor::log(),
+              Not(Contains("RecordingExtractor::HandleTranslationUnit")));
+  EXPECT_FALSE(llvm::sys::fs::exists(Output));
+}
+
+// The reporting control for the two tests above: the same fixture, the same
+// options, a source that compiles -- and a summary does appear. Without this,
+// an EXPECT_FALSE(exists(Output)) is not evidence the guard fired.
+TEST_F(TUSummaryExtractorFrontendActionTest,
+       CleanCompileStillWritesSummary_Control) {
+  resetCompiler("void takes_pointer(int *p) { (void)p; }");
+
+  std::string Output = makePath("output.MockSerializationFormat");
+  Compiler->getSSAFOpts().TUSummaryFile = Output;
+  Compiler->getSSAFOpts().ExtractSummaries = {"RecordingExtractor"};
+  Compiler->getSSAFOpts().CompilationUnitId = "test-cu";
+
+  RecordingExtractor::log().clear();
+
+  TUSummaryExtractorFrontendAction Action(std::make_unique<RecordingAction>());
+  EXPECT_TRUE(Compiler->ExecuteAction(Action));
+
+  EXPECT_THAT(RecordingExtractor::log(),
+              Contains("RecordingExtractor::HandleTranslationUnit"));
+  EXPECT_TRUE(llvm::sys::fs::exists(Output));
+}
+
+// hasUncompilableErrorOccurred() rather than hasErrorOccurred(): a warning that
+// -Werror promoted is not a compile failure. The AST is well-formed and the
+// summary must still be written, or every -Werror build that tripped a benign
+// warning would silently lose its summary.
+TEST_F(TUSummaryExtractorFrontendActionTest,
+       WarningPromotedByWerrorStillWritesSummary) {
+  resetCompiler("void f() { int unused_local; }",
+                {"error=unused-variable"});
+
+  std::string Output = makePath("output.MockSerializationFormat");
+  Compiler->getSSAFOpts().TUSummaryFile = Output;
+  Compiler->getSSAFOpts().ExtractSummaries = {"NoOpExtractor"};
+  Compiler->getSSAFOpts().CompilationUnitId = "test-cu";
+
+  TUSummaryExtractorFrontendAction Action(std::make_unique<RecordingAction>());
+  Compiler->ExecuteAction(Action);
+
+  // The promotion did happen -- otherwise this test would pass for the wrong
+  // reason, by never producing an error at all.
+  EXPECT_THAT(errorMsgsVecOf(DiagBuf),
+              Contains("unused variable 'unused_local'"));
+  EXPECT_THAT(errorMsgsVecOf(DiagBuf),
+              Not(Contains("not writing TU summary to '" + Output +
+                           "': this translation unit failed to compile, so its "
+                           "summary would describe an error-recovery AST")));
+  EXPECT_TRUE(llvm::sys::fs::exists(Output));
 }
 
 } // namespace

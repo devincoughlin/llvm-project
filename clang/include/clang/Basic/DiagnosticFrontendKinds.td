@@ -519,6 +519,11 @@ def warn_ssaf_write_tu_summary_failed :
   Warning<"failed to write TU summary to '%0': %1">,
   InGroup<ScalableStaticAnalysis>, DefaultError;
 
+def warn_ssaf_tu_summary_not_written_after_errors :
+  Warning<"not writing TU summary to '%0': this translation unit failed to "
+          "compile, so its summary would describe an error-recovery AST">,
+  InGroup<ScalableStaticAnalysis>, DefaultError;
+
 def warn_ssaf_tu_summary_requires_compilation_unit_id :
   Warning<"option '--ssaf-tu-summary-file=' requires "
           "'--ssaf-compilation-unit-id=' to be set">,
