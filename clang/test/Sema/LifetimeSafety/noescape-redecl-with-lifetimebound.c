@@ -14,7 +14,7 @@
 // of input, where the `noescape` half comes from a header or from API Notes and
 // nothing in the file being compiled mentions it.
 
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -Wlifetime-safety-noescape -Wlifetime-safety-lifetimebound-violation \
 // RUN:   -verify %s
 

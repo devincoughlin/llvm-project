@@ -14,7 +14,7 @@
 // `-Wno-deprecated-non-prototype` is only to keep the unprototyped
 // declarations below from adding diagnostics unrelated to what is under test.
 
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -Wlifetime-safety-noescape -Wno-deprecated-non-prototype -verify %s
 
 // Reporting control. Annotated on the definition, which already warned before

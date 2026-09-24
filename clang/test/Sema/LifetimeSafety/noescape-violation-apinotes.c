@@ -10,7 +10,7 @@
 // RUN: rm -rf %t && mkdir -p %t
 
 // API Notes on.
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -Wlifetime-safety-noescape -fmodules -fimplicit-module-maps \
 // RUN:   -fmodules-cache-path=%t/on -fapinotes-modules \
 // RUN:   -I %S/Inputs/apinotes -verify=common,notes %s
@@ -19,7 +19,7 @@
 // nowhere, so `audited` becomes indistinguishable from `unaudited` and only the
 // in-file control still fires. Without this run the test could pass with the
 // .apinotes file never being read.
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -Wlifetime-safety-noescape -fmodules -fimplicit-module-maps \
 // RUN:   -fmodules-cache-path=%t/off \
 // RUN:   -I %S/Inputs/apinotes -verify=common %s

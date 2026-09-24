@@ -9,7 +9,7 @@
 // binary, the declaration on line 20 used to carry
 // `warning: parameter in intra-TU function should be marked [[clang::lifetimebound]]`.
 
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -Wlifetime-safety-suggestions -Wlifetime-safety-noescape -verify %s
 
 // Reporting control: the suggestion machinery is live in this file.

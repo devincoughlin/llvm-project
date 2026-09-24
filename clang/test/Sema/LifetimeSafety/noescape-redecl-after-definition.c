@@ -10,10 +10,10 @@
 // This file pins the current behaviour of both modes rather than asserting that
 // either is right. The divergence is filed as a follow-up.
 
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -Wlifetime-safety-noescape -Wlifetime-safety-suggestions \
 // RUN:   -verify=common,perfunc %s
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -fexperimental-lifetime-safety-tu-analysis \
 // RUN:   -Wlifetime-safety-noescape -Wlifetime-safety-suggestions \
 // RUN:   -verify=common,tu %s

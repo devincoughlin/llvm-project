@@ -14,14 +14,14 @@
 
 // 1. Non-modules API Notes, discovered as APINotes.apinotes in the header's own
 //    directory. No module map and no module cache are involved.
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -Wlifetime-safety-noescape -fapinotes \
 // RUN:   -I %S/Inputs/apinotes-definition -verify=both,notes %s
 
 // 2. The module-building path, where the notes are named after the module and
 //    the header is analyzed as the module is compiled.
 // RUN: rm -rf %t && mkdir -p %t
-// RUN: %clang_cc1 -emit-module -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -emit-module -std=c17 \
 // RUN:   -Wlifetime-safety-noescape -fmodules -fmodule-name=NoescapeDefn \
 // RUN:   -fapinotes-modules -fmodules-cache-path=%t/mc \
 // RUN:   -I %S/Inputs/apinotes-definition -verify=both,notes \
@@ -31,7 +31,7 @@
 //    the header's bytes is left, so `defined_in_header` becomes indistinguish-
 //    able from `unannotated_in_header`. Without this run both runs above could
 //    pass with the .apinotes file never being read.
-// RUN: %clang_cc1 -fsyntax-only -std=c17 -fexperimental-lifetime-safety-c \
+// RUN: %clang_cc1 -fsyntax-only -std=c17 \
 // RUN:   -Wlifetime-safety-noescape \
 // RUN:   -I %S/Inputs/apinotes-definition -verify=both %s
 
