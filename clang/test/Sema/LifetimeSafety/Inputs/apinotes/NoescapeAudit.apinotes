@@ -1,0 +1,6 @@
+Name: NoescapeAudit
+Functions:
+  - Name: audited
+    Parameters:
+      - Position: 0
+        NoEscape: true

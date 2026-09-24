@@ -11221,6 +11221,16 @@ def warn_lifetime_safety_noescape_escapes
       InGroup<LifetimeSafetyNoescape>,
       DefaultIgnore;
 
+// Points at the 'noescape' that the warning above is about. It can be on a
+// different declaration than the definition being analyzed, and it need not
+// appear in the source at all -- API Notes supply it with no source location,
+// and a function typedef carries it in the type rather than on a parameter.
+def note_lifetime_safety_noescape_here
+    : Note<"'noescape' attribute appears here">;
+def note_lifetime_safety_noescape_not_written
+    : Note<"'noescape' applies to this declaration without appearing in its "
+           "source">;
+
 // For non-floating point, expressions of the form x == x or x != x
 // should result in a warning, since these always evaluate to a constant.
 // Array comparisons have similar warnings

@@ -131,6 +131,15 @@ public:
   // assignment to a global variable
   virtual void reportNoescapeViolation(const ParmVarDecl *ParmWithNoescape,
                                        const VarDecl *EscapeGlobal) {}
+  // Attaches a note to the noescape violation just reported, pointing at the
+  // 'noescape' it is about. \p AnnotationLoc may be on a different
+  // declaration than the definition that was analyzed. \p AppearsInSource is
+  // false when the annotation is not spelled at that location -- API Notes
+  // supply the attribute with no source location, and a function typedef
+  // carries the annotation in the type rather than on a parameter -- in which
+  // case \p AnnotationLoc names the declaration that carries it instead.
+  virtual void noteNoescapeAnnotation(SourceLocation AnnotationLoc,
+                                      bool AppearsInSource) {}
 
   // Reports misuse of [[clang::lifetimebound]] when parameter doesn't escape
   // through return.
